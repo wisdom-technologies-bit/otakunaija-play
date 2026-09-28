@@ -1,4 +1,5 @@
 import { createAdminClient } from '@/lib/supabase/admin'
+import { signProxyUrl } from '@/lib/proxy-signing'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -104,6 +105,19 @@ function ageMs(value: string) {
   return Date.now() - new Date(value).getTime()
 }
 
+function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, stream: NormalizedStream) {
+  const headers = stream.headers as Record<string, string>
+  const proxied = Object.keys(headers).length > 0
+  return {
+    playId,
+    audio,
+    provider,
+    ...stream,
+    streamUrl: proxied ? signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest') : stream.streamUrl,
+    headers: proxied ? {} : stream.headers,
+  }
+}
+
 async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean) {
   const responses = await Promise.allSettled(entries.map((entry) => fetchWatch(entry.episodeId ?? '')))
   for (let index = 0; index < entries.length; index += 1) {
@@ -141,7 +155,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     const cached = entries.find((entry) => entry.provider === episode.resolved_provider)
     if (cached?.episodeId) {
       const stream = qualify(await fetchWatch(cached.episodeId), episode.resolved_audio === 'sub')
-      if (stream) return json({ playId, audio: episode.resolved_audio, provider: episode.resolved_provider, ...stream })
+      if (stream) return json(responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream))
     }
   }
 
@@ -160,5 +174,5 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     .eq('play_id', playId)
   if (updateError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
 
-  return json({ playId, audio: winner.audio, provider: winner.provider, ...winner.stream })
+  return json(responseFor(playId, winner.audio, winner.provider, winner.stream))
 }

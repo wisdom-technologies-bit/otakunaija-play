@@ -114,7 +114,7 @@ export async function GET() {
     .select('play_id, anilist_id, episode_number, title, description, image_url, air_date, duration, export_attempts')
     .eq('exported_to_otaku', false)
     .lt('export_attempts', 5)
-    .or('sub_providers.not.eq.[],dub_providers.not.eq.[]')
+    .or('sub_providers.neq.[],dub_providers.neq.[]')
     .order('created_at', { ascending: true })
     .limit(BATCH_SIZE)
 
@@ -185,7 +185,3 @@ export async function GET() {
   return Response.json({ episodesSelected: rows.length, episodesExported, episodesBlockedByAnime, episodesFailed, episodesRetrying })
 }
 
-type _KeepTypes = AnimeRow
-void _KeepTypes
-
-export default undefined

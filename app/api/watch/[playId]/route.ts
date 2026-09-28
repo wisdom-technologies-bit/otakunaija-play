@@ -105,7 +105,7 @@ function ageMs(value: string) {
   return Date.now() - new Date(value).getTime()
 }
 
-function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, stream: NormalizedStream) {
+async function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, stream: NormalizedStream) {
   const headers = stream.headers as Record<string, string>
   const proxied = Object.keys(headers).length > 0
   return {
@@ -113,7 +113,7 @@ function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, str
     audio,
     provider,
     ...stream,
-    streamUrl: proxied ? signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest') : stream.streamUrl,
+    streamUrl: proxied ? await signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest') : stream.streamUrl,
     headers: proxied ? {} : stream.headers,
   }
 }
@@ -155,7 +155,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     const cached = entries.find((entry) => entry.provider === episode.resolved_provider)
     if (cached?.episodeId) {
       const stream = qualify(await fetchWatch(cached.episodeId), episode.resolved_audio === 'sub')
-      if (stream) return json(responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream))
+      if (stream) return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream))
     }
   }
 
@@ -174,5 +174,5 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     .eq('play_id', playId)
   if (updateError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
 
-  return json(responseFor(playId, winner.audio, winner.provider, winner.stream))
+  return json(await responseFor(playId, winner.audio, winner.provider, winner.stream))
 }

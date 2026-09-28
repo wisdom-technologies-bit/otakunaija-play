@@ -1,11 +1,10 @@
-import crypto from 'node:crypto'
-
 function encode(value: string) {
-  return Buffer.from(value, 'utf8').toString('base64url')
+  return btoa(unescape(encodeURIComponent(value))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
 function decode(value: string) {
-  return Buffer.from(value, 'base64url').toString('utf8')
+  const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (value.length % 4)) % 4)
+  return decodeURIComponent(escape(atob(padded)))
 }
 
 function secret() {
@@ -14,20 +13,27 @@ function secret() {
   return value
 }
 
-export function signProxyUrl(targetUrl: string, headers: Record<string, string>, routeBasePath: string) {
+async function hmac(message: string) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret()), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const digest = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+export async function signProxyUrl(targetUrl: string, headers: Record<string, string>, routeBasePath: string) {
   const u = encode(targetUrl)
   const h = encode(JSON.stringify(headers))
   const e = Math.floor(Date.now() / 1000) + 14_400
-  const s = crypto.createHmac('sha256', secret()).update(`${u}.${h}.${e}`).digest('hex')
+  const s = await hmac(`${u}.${h}.${e}`)
   return `${routeBasePath}?u=${u}&h=${h}&e=${e}&s=${s}`
 }
 
-export function verifyProxySignature(u: string, h: string, e: string, s: string) {
+export async function verifyProxySignature(u: string, h: string, e: string, s: string) {
   try {
-    const expected = crypto.createHmac('sha256', secret()).update(`${u}.${h}.${e}`).digest('hex')
-    const provided = Buffer.from(s, 'hex')
-    const expectedBytes = Buffer.from(expected, 'hex')
-    if (provided.length !== expectedBytes.length || !crypto.timingSafeEqual(provided, expectedBytes)) return { valid: false }
+    const expected = await hmac(`${u}.${h}.${e}`)
+    if (s.length !== expected.length || !/^[0-9a-f]+$/i.test(s)) return { valid: false }
+    let mismatch = 0
+    for (let index = 0; index < expected.length; index += 1) mismatch |= expected.charCodeAt(index) ^ s.toLowerCase().charCodeAt(index)
+    if (mismatch !== 0) return { valid: false }
     if (!Number.isFinite(Number(e)) || Number(e) < Math.floor(Date.now() / 1000)) return { valid: false }
     const headers = JSON.parse(decode(h))
     if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return { valid: false }
@@ -36,6 +42,11 @@ export function verifyProxySignature(u: string, h: string, e: string, s: string)
     return { valid: false }
   }
 }
+
+export async function proxyUrl(targetUrl: string, headers: Record<string, string>, routeBasePath: string) {
+  return signProxyUrl(targetUrl, headers, routeBasePath)
+}
+
 
 export function withDefaultUserAgent(headers: Record<string, string>) {
   const next = { ...headers }

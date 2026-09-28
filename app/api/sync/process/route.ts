@@ -78,6 +78,7 @@ async function fetchJikan(malId: number) {
     title?: string | null; synopsis?: string | null; images?: { jpg?: { large_image_url?: string | null } }
     genres?: Array<{ name?: string }>; status?: string | null; year?: number | null
     aired?: { prop?: { from?: { year?: number | null } } }
+    studios?: Array<{ name?: string | null }>
   } }
 }
 
@@ -167,12 +168,12 @@ export async function GET() {
         .from('anime').select('anilist_id').eq('anilist_id', row.anilist_id).maybeSingle()
       if (animeLookupError) throw animeLookupError
       if (!existingAnime) {
-        let anime = { anilist_id: row.anilist_id, mal_id: malId, title: animeTitle, description: null as string | null, cover_url: null as string | null, genres: null as string[] | null, status: null as string | null, release_year: null as number | null }
+        let anime = { anilist_id: row.anilist_id, mal_id: malId, title: animeTitle, description: null as string | null, cover_url: null as string | null, genres: null as string[] | null, status: null as string | null, release_year: null as number | null, studio: null as string | null }
         if (malId !== null) {
           try {
             const jikan = await fetchJikan(malId)
             const data = jikan.data
-            anime = { ...anime, title: data?.title || animeTitle, description: data?.synopsis ?? null, cover_url: data?.images?.jpg?.large_image_url ?? null, genres: data?.genres?.map((genre) => genre.name).filter((name): name is string => Boolean(name)) ?? [], status: data?.status ?? null, release_year: data?.year ?? data?.aired?.prop?.from?.year ?? null }
+            anime = { ...anime, title: data?.title || animeTitle, description: data?.synopsis ?? null, cover_url: data?.images?.jpg?.large_image_url ?? null, genres: data?.genres?.map((genre) => genre.name).filter((name): name is string => Boolean(name)) ?? [], status: data?.status ?? null, release_year: data?.year ?? data?.aired?.prop?.from?.year ?? null, studio: data?.studios?.[0]?.name ?? null }
           } catch {
             // The requested fallback is the minimal anime row.
           }

@@ -14,6 +14,7 @@ const BATCH_SIZE = 10
 const TIME_BUDGET_MS = 50_000
 const ANIVEXA_TIMEOUT_MS = 40_000
 let lastJikanCallAt = 0
+let lastAniListCallAt = 0
 
 type ProviderEpisode = {
   id?: string
@@ -60,6 +61,49 @@ async function fetchAnivexa(anilistId: number) {
     throw error
   } finally {
     clearTimeout(timeout)
+  }
+}
+
+async function fetchAniListImages(anilistId: number) {
+  const elapsed = Date.now() - lastAniListCallAt
+  if (elapsed < 700) await wait(700 - elapsed)
+
+  const request = async () => {
+    lastAniListCallAt = Date.now()
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 10_000)
+    try {
+      const response = await fetch('https://graphql.anilist.co', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          query: 'query ($id: Int) { Media(id: $id, type: ANIME) { coverImage { extraLarge } bannerImage } }',
+          variables: { id: anilistId },
+        }),
+        signal: controller.signal,
+        cache: 'no-store',
+      })
+      if (!response.ok) throw new Error(`AniList HTTP ${response.status}`)
+      const payload = await response.json() as { data?: { Media?: { coverImage?: { extraLarge?: string | null } | null; bannerImage?: string | null } | null } }
+      const media = payload.data?.Media
+      if (!media) throw new Error('AniList returned no media data')
+      return { poster_url: media.coverImage?.extraLarge ?? null, banner_url: media.bannerImage ?? null }
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw new Error('AniList image request timed out')
+      throw error
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  try {
+    return await request()
+  } catch (error) {
+    if (error instanceof Error && error.message === 'AniList HTTP 429') {
+      await wait(3000)
+      return request()
+    }
+    throw error
   }
 }
 
@@ -168,7 +212,7 @@ export async function GET() {
         .from('anime').select('anilist_id').eq('anilist_id', row.anilist_id).maybeSingle()
       if (animeLookupError) throw animeLookupError
       if (!existingAnime) {
-        let anime = { anilist_id: row.anilist_id, mal_id: malId, title: animeTitle, description: null as string | null, cover_url: null as string | null, genres: null as string[] | null, status: null as string | null, release_year: null as number | null, studio: null as string | null }
+        let anime = { anilist_id: row.anilist_id, mal_id: malId, title: animeTitle, description: null as string | null, cover_url: null as string | null, poster_url: null as string | null, banner_url: null as string | null, genres: null as string[] | null, status: null as string | null, release_year: null as number | null, studio: null as string | null }
         if (malId !== null) {
           try {
             const jikan = await fetchJikan(malId)
@@ -177,6 +221,12 @@ export async function GET() {
           } catch {
             // The requested fallback is the minimal anime row.
           }
+        }
+        try {
+          const images = await fetchAniListImages(row.anilist_id)
+          anime = { ...anime, ...images }
+        } catch {
+          anime = { ...anime, poster_url: null, banner_url: null }
         }
         const { error } = await supabase.from('anime').insert(anime)
         if (error) throw error

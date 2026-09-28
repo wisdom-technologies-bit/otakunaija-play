@@ -21,6 +21,8 @@ type AnimeRow = {
   status: string | null
   release_year: number | null
   studio: string | null
+  poster_url: string | null
+  banner_url: string | null
   otaku_anime_id: number | null
   exported_to_otaku: boolean
   export_attempts: number
@@ -129,7 +131,7 @@ export async function GET() {
 
   for (const episode of rows as EpisodeRow[]) {
     if (Date.now() - startedAt >= TIME_BUDGET_MS) break
-    const { data: anime, error: animeLookupError } = await supabase.from('anime').select('anilist_id, title, description, cover_url, genres, status, release_year, studio, otaku_anime_id, exported_to_otaku, export_attempts').eq('anilist_id', episode.anilist_id).maybeSingle()
+    const { data: anime, error: animeLookupError } = await supabase.from('anime').select('anilist_id, title, description, cover_url, genres, status, release_year, studio, poster_url, banner_url, otaku_anime_id, exported_to_otaku, export_attempts').eq('anilist_id', episode.anilist_id).maybeSingle()
     if (animeLookupError || !anime) {
       episodesBlockedByAnime += 1
       continue
@@ -147,6 +149,8 @@ export async function GET() {
           status: animeRow.status,
           releaseYear: animeRow.release_year,
           studioName: animeRow.studio,
+          posterUrl: animeRow.poster_url,
+          bannerUrl: animeRow.banner_url,
         })
         if (![200, 201].includes(result.response.status) || typeof result.payload.seriesId !== 'number') throw new Error(`Anime export HTTP ${result.response.status}`)
         const { error: saveAnimeError } = await supabase.from('anime').update({ otaku_anime_id: result.payload.seriesId, exported_to_otaku: true, last_export_error: null }).eq('anilist_id', animeRow.anilist_id)

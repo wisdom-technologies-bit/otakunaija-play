@@ -143,7 +143,8 @@ export async function GET() {
       const animeTitle = mappings.title ?? ''
       const subProviders: Array<{ provider: string; episodeId: string }> = []
       const dubProviders: Array<{ provider: string; episodeId: string }> = []
-      let metadata: ProviderEpisode | null = null
+      let firstSubMatch: ProviderEpisode | null = null
+      let firstDubMatch: ProviderEpisode | null = null
 
       for (const providerName of PROVIDERS) {
         const provider = payload[providerName] as AnivexaProvider | undefined
@@ -151,14 +152,16 @@ export async function GET() {
         const sub = pickEpisode(provider, row.episode_number, 'sub')
         if (sub?.id) {
           subProviders.push({ provider: providerName, episodeId: sub.id })
-          metadata ??= sub
+          firstSubMatch ??= sub
         }
         const dub = pickEpisode(provider, row.episode_number, 'dub')
         if (dub?.id) {
           dubProviders.push({ provider: providerName, episodeId: dub.id })
-          if (!metadata) metadata = dub
+          firstDubMatch ??= dub
         }
       }
+
+      const metadata = firstSubMatch ?? firstDubMatch
 
       const { data: existingAnime, error: animeLookupError } = await supabase
         .from('anime').select('anilist_id').eq('anilist_id', row.anilist_id).maybeSingle()

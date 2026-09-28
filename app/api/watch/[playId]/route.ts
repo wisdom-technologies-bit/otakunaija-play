@@ -108,6 +108,13 @@ function ageMs(value: string) {
 async function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, stream: NormalizedStream) {
   const headers = stream.headers as Record<string, string>
   const proxied = Object.keys(headers).length > 0
+  const subtitles = await Promise.all(stream.subtitles.map(async (subtitle) => {
+    if (typeof subtitle.url !== 'string' || subtitle.url.length === 0) return subtitle
+    return {
+      ...subtitle,
+      url: await signProxyUrl(subtitle.url, headers, '/api/proxy/subtitle'),
+    }
+  }))
   return {
     playId,
     audio,
@@ -115,6 +122,7 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
     ...stream,
     streamUrl: proxied ? await signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest') : stream.streamUrl,
     headers: proxied ? {} : stream.headers,
+    subtitles,
   }
 }
 

@@ -207,6 +207,18 @@ export async function GET() {
       }
 
       const metadata = firstSubMatch ?? firstDubMatch
+      const hasUsableMetadata = Boolean(
+        metadata && (
+          metadata.title != null ||
+          metadata.description != null ||
+          metadata.image != null ||
+          metadata.airDate != null ||
+          (metadata.duration != null && metadata.duration > 0) ||
+          metadata.filler === true ||
+          metadata.recap === true
+        ),
+      )
+      if (!hasUsableMetadata) throw new Error('Anivexa returned no usable episode metadata')
 
       const { data: existingAnime, error: animeLookupError } = await supabase
         .from('anime').select('anilist_id').eq('anilist_id', row.anilist_id).maybeSingle()

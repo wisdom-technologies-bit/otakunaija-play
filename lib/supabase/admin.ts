@@ -62,10 +62,19 @@ export async function fetchAniListPage(page: number, now: number) {
       'content-type': 'application/json',
     },
     body: JSON.stringify({
-      query: `query ($page: Int, $perPage: Int, $airingAtLesser: Int) {
+      query: `query (
+  $page: Int
+  $perPage: Int
+  $airingAtGreater: Int
+  $airingAtLesser: Int
+) {
   Page(page: $page, perPage: $perPage) {
     pageInfo { hasNextPage }
-    airingSchedules(sort: TIME_DESC, airingAt_lesser: $airingAtLesser) {
+    airingSchedules(
+      sort: TIME_DESC
+      airingAt_greater: $airingAtGreater
+      airingAt_lesser: $airingAtLesser
+    ) {
       episode
       airingAt
       media {
@@ -81,6 +90,7 @@ export async function fetchAniListPage(page: number, now: number) {
       variables: {
         page,
         perPage: 50,
+        airingAtGreater: now - 172800,
         airingAtLesser: now,
       },
     }),

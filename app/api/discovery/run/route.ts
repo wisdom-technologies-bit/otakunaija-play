@@ -2,6 +2,7 @@ import {
   MAX_PAGES,
   MAX_RETRIES,
   deduplicateEntries,
+  findExistingPendingSyncEntries,
   fetchAniListPage,
   getAniListError,
   getCurrentUnixTime,
@@ -58,13 +59,57 @@ export async function GET() {
       if (shouldPauseBeforeNextPage(headers)) await sleep(getWaitSeconds(headers))
     }
 
-    const entries = deduplicateEntries(toPendingSyncEntries(collected))
+    const allEntries = toPendingSyncEntries(collected)
+    const entries = deduplicateEntries(allEntries)
+    const existingKeys = await findExistingPendingSyncEntries(entries)
+    const deduplicatedKeys = new Set<string>()
+    const seenKeys = new Set<string>()
+
+    for (const entry of allEntries) {
+      const key = `${entry.anilist_id}-${entry.episode_number}`
+      if (seenKeys.has(key)) deduplicatedKeys.add(key)
+      seenKeys.add(key)
+    }
+
+    const diagnostics = collected.map((schedule, index) => {
+      const entry = allEntries[index]
+      const hasValidAnimeData = Number.isInteger(entry?.anilist_id) && entry.anilist_id > 0
+      const hasValidEpisodeData = Number.isInteger(entry?.episode_number) && entry.episode_number > 0
+      const key = entry ? `${entry.anilist_id}-${entry.episode_number}` : null
+      const reasons: string[] = []
+
+      if (!hasValidAnimeData || !hasValidEpisodeData) reasons.push('invalid_required_data')
+      if (key && existingKeys.has(key)) reasons.push('already_known')
+      if (key && deduplicatedKeys.has(key)) reasons.push('deduplicated')
+
+      return {
+        anilistId: schedule.media?.id ?? null,
+        episode: schedule.episode ?? null,
+        airingAt: schedule.airingAt ?? null,
+        reasons,
+        convertedToPendingSync: Boolean(entry),
+      }
+    })
+
     const inserted = await insertPendingSync(entries)
+    const diagnosticCounts = {
+      alreadyKnown: diagnostics.filter((item) => item.reasons.includes('already_known')).length,
+      rejectedByAgeWindow: 0,
+      invalidRequiredData: diagnostics.filter((item) => item.reasons.includes('invalid_required_data')).length,
+      deduplicated: diagnostics.filter((item) => item.reasons.includes('deduplicated')).length,
+      convertedToPendingSync: entries.length,
+      successfullyInserted: inserted,
+    }
 
     return Response.json({
       pagesFetched,
       airingSchedulesSeen: collected.length,
       pendingSyncInserted: inserted,
+      diagnostics: {
+        counts: diagnosticCounts,
+        schedules: diagnostics,
+        note: 'The 48-hour boundary is applied by AniList query variables; the existing one-day check only stops pagination and does not reject schedules.',
+      },
     })
   } catch (error) {
     return jsonError(getErrorMessage(error))

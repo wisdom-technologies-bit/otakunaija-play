@@ -55,6 +55,27 @@ export async function insertPendingSync(entries: PendingSyncEntry[]) {
   return data?.length ?? 0
 }
 
+export async function findExistingPendingSyncEntries(entries: PendingSyncEntry[]) {
+  if (entries.length === 0) return new Set<string>()
+
+  const supabase = createAdminClient()
+  const anilistIds = Array.from(new Set(entries.map((entry) => entry.anilist_id)))
+  const { data, error } = await supabase
+    .from('pending_sync')
+    .select('anilist_id, episode_number')
+    .in('anilist_id', anilistIds)
+
+  if (error) throw new Error(`Failed to inspect pending sync rows: ${error.message}`)
+
+  return new Set(
+    (data ?? []).map((entry) => `${entry.anilist_id}-${entry.episode_number}`),
+  )
+}
+
+export function pendingSyncKey(entry: PendingSyncEntry) {
+  return `${entry.anilist_id}-${entry.episode_number}`
+}
+
 export async function fetchAniListPage(page: number, now: number) {
   const response = await fetch('https://graphql.anilist.co', {
     method: 'POST',

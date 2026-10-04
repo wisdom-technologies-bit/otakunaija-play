@@ -44,6 +44,7 @@ type EpisodeRow = {
   resolved_provider: string | null
   resolved_audio: 'sub' | 'dub' | null
   resolved_at: string | null
+  needs_resync: boolean
 }
 
 const corsHeaders = {
@@ -147,7 +148,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   const supabase = createAdminClient()
   const { data: episode, error } = await supabase
     .from('episodes')
-    .select('play_id, sub_providers, dub_providers, resolved_provider, resolved_audio, resolved_at')
+    .select('play_id, sub_providers, dub_providers, resolved_provider, resolved_audio, resolved_at, needs_resync')
     .eq('play_id', playId)
     .maybeSingle<EpisodeRow>()
 
@@ -163,7 +164,13 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     const cached = entries.find((entry) => entry.provider === episode.resolved_provider)
     if (cached?.episodeId) {
       const stream = qualify(await fetchWatch(cached.episodeId), episode.resolved_audio === 'sub')
-      if (stream) return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream))
+      if (stream) {
+        if (episode.needs_resync) {
+          const { error: resyncClearError } = await supabase.from('episodes').update({ needs_resync: false, resync_requested_at: null }).eq('play_id', playId)
+          if (resyncClearError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
+        }
+        return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream))
+      }
     }
   }
 
@@ -174,11 +181,19 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     : dubWinner
       ? { audio: 'dub' as const, provider: dubWinner.provider, stream: dubWinner.stream }
       : null
-  if (!winner) return json({ error: 'NO_WORKING_STREAM' }, 404)
+  if (!winner) {
+    await supabase.from('episodes').update({ needs_resync: true, resync_requested_at: new Date().toISOString() }).eq('play_id', playId)
+    return json({ error: 'NO_WORKING_STREAM' }, 404)
+  }
 
   const { error: updateError } = await supabase
     .from('episodes')
-    .update({ resolved_provider: winner.provider, resolved_audio: winner.audio, resolved_at: new Date().toISOString() })
+    .update({
+      resolved_provider: winner.provider,
+      resolved_audio: winner.audio,
+      resolved_at: new Date().toISOString(),
+      ...(episode.needs_resync ? { needs_resync: false, resync_requested_at: null } : {}),
+    })
     .eq('play_id', playId)
   if (updateError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
 

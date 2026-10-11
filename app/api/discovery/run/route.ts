@@ -3,6 +3,7 @@ import {
   MAX_RETRIES,
   deduplicateEntries,
   findExistingPendingSyncEntries,
+  fetchAniListCatalogPage,
   fetchAniListPage,
   getAniListError,
   getCurrentUnixTime,
@@ -11,6 +12,7 @@ import {
   insertPendingSync,
   isOlderThanOneDay,
   jsonError,
+  parseAniListCatalogResponse,
   parseAniListResponse,
   scheduleRetryAfter429,
   shouldPauseBeforeNextPage,
@@ -59,6 +61,45 @@ export async function GET() {
       if (shouldPauseBeforeNextPage(headers)) await sleep(getWaitSeconds(headers))
     }
 
+    const catalogEntries = []
+    let catalogPagesFetched = 0
+    let catalogEntriesSeen = 0
+    const catalogCutoff = now - 7 * 86400
+
+    for (let page = 1; page <= 3; page += 1) {
+      let response: Response
+      let responseHeaders: Headers | null = null
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+        response = await fetchAniListCatalogPage(page)
+        if (response.status === 429) {
+          if (attempt === MAX_RETRIES) throw new Error('AniList catalog rate limit retry exhausted')
+          await sleep(scheduleRetryAfter429(response.headers))
+          continue
+        }
+        if (!response.ok) throw new Error(getAniListError(response.status))
+        responseHeaders = response.headers
+        break
+      }
+
+      catalogPagesFetched += 1
+      const catalog = parseAniListCatalogResponse(await response!.json())
+      catalogEntriesSeen += catalog.media.length
+      const recentMedia = catalog.media.filter((media) => {
+        const { year, month, day } = media.startDate ?? {}
+        if (!year || !month || !day) return false
+        return Math.floor(Date.UTC(year, month - 1, day) / 1000) >= catalogCutoff
+      })
+      catalogEntries.push(...recentMedia.map((media) => ({ anilist_id: media.id, episode_number: 1 })))
+
+      const pageIsOlderThanSevenDays = catalog.media.length > 0 && catalog.media.every((media) => {
+        const { year, month, day } = media.startDate ?? {}
+        return !year || !month || !day || Math.floor(Date.UTC(year, month - 1, day) / 1000) < catalogCutoff
+      })
+      if (!catalog.hasNextPage || pageIsOlderThanSevenDays || page === 3) break
+      if (responseHeaders && shouldPauseBeforeNextPage(responseHeaders)) await sleep(getWaitSeconds(responseHeaders))
+    }
+
+    const catalogPendingSyncInserted = await insertPendingSync(deduplicateEntries(catalogEntries))
     const allEntries = toPendingSyncEntries(collected)
     const entries = deduplicateEntries(allEntries)
     const existingKeys = await findExistingPendingSyncEntries(entries)
@@ -105,6 +146,9 @@ export async function GET() {
       pagesFetched,
       airingSchedulesSeen: collected.length,
       pendingSyncInserted: inserted,
+      catalogPagesFetched,
+      catalogEntriesSeen,
+      catalogPendingSyncInserted,
       diagnostics: {
         counts: diagnosticCounts,
         schedules: diagnostics,

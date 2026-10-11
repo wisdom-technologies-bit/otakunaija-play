@@ -2,11 +2,11 @@ import { createAdminClient } from '@/lib/supabase/admin'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 90
+export const maxDuration = 55
 
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
 const ANIVEXA_TIMEOUT_MS = 40_000
-const BATCH_SIZE = 15
+const BATCH_SIZE = 30
 const START_BUDGET_MS = 45_000
 const PROVIDERS = [
   'mkissa', 'reanime', 'anikoto', 'animegg', 'anineko', 'anidbapp', 'animenosub',
@@ -52,7 +52,7 @@ function buildProviders(payload: Payload, episodeNumber: number) {
   return { sub_providers: subProviders, dub_providers: dubProviders }
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   const startedAt = Date.now()
   const supabase = createAdminClient()
   const { data: failedRows, error: failedError } = await supabase
@@ -71,7 +71,33 @@ export async function GET() {
     }
   }
 
-  const remaining = Math.max(0, BATCH_SIZE - failedCandidates.length)
+  const dubOnlyCandidates: Candidate[] = []
+  const { data: dubOnlyRows, error: dubOnlyError } = await supabase
+    .from('episodes')
+    .select('anilist_id, dub_providers, sub_providers')
+  if (dubOnlyError) return Response.json({ error: dubOnlyError.message }, { status: 500 })
+
+  const dubOnlyIds = Array.from(new Set((dubOnlyRows ?? [])
+    .filter((row) => Array.isArray(row.dub_providers) && row.dub_providers.length > 0 && Array.isArray(row.sub_providers) && row.sub_providers.length === 0)
+    .map((row) => row.anilist_id)
+    .filter((id): id is number => typeof id === 'number' && !failedSeen.has(id))))
+  if (dubOnlyIds.length > 0) {
+    const { data: dubOnlyAnime, error: dubOnlyAnimeError } = await supabase
+      .from('anime')
+      .select('anilist_id, last_resynced_at')
+      .in('anilist_id', dubOnlyIds)
+      .order('last_resynced_at', { ascending: true, nullsFirst: true })
+      .limit(BATCH_SIZE - failedCandidates.length)
+    if (dubOnlyAnimeError) return Response.json({ error: dubOnlyAnimeError.message }, { status: 500 })
+    for (const row of dubOnlyAnime ?? []) {
+      if (typeof row.anilist_id === 'number' && !failedSeen.has(row.anilist_id)) {
+        failedSeen.add(row.anilist_id)
+        dubOnlyCandidates.push({ anilist_id: row.anilist_id, failed: false, priorityAt: null })
+      }
+    }
+  }
+
+  const remaining = Math.max(0, BATCH_SIZE - failedCandidates.length - dubOnlyCandidates.length)
   const airingCandidates: Candidate[] = []
   if (remaining > 0) {
     const { data: airingRows, error: airingError } = await supabase
@@ -89,8 +115,9 @@ export async function GET() {
     }
   }
 
-  const selected = [...failedCandidates, ...airingCandidates].slice(0, BATCH_SIZE)
-  if (selected.length === 0) return Response.json({ animeProcessed: 0, message: 'nothing to resync' })
+  const selected = [...failedCandidates, ...dubOnlyCandidates, ...airingCandidates].slice(0, BATCH_SIZE)
+  const chainDepth = Math.max(0, Number.parseInt(new URL(request.url).searchParams.get('chainDepth') ?? '0', 10) || 0)
+  if (selected.length === 0) return Response.json({ animeProcessed: 0, chainDepth, message: 'nothing to resync' })
 
   let animeProcessed = 0
   let animeFailed = 0
@@ -130,6 +157,12 @@ export async function GET() {
     }
   }
 
+  if (animeSkippedByBudget > 0 && chainDepth < 5) {
+    void fetch(`${new URL(request.url).origin}/api/resync/run?chainDepth=${chainDepth + 1}`, { method: 'GET' }).catch((error) => {
+      console.error('[resync] chained invocation failed', error)
+    })
+  }
+
   return Response.json({
     animeSelected: selected.length,
     animeProcessed,
@@ -137,6 +170,7 @@ export async function GET() {
     episodesUpdated,
     animeSkippedByBudget,
     prioritizedForFailedWatch: failedCandidates.length,
+    chainDepth,
   })
 }
 

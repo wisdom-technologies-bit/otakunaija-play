@@ -2,7 +2,7 @@ import { createAdminClient } from '@/lib/supabase/admin'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 55
+export const maxDuration = 90
 
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
 const REQUEST_TIMEOUT_MS = 20_000

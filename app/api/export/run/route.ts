@@ -26,6 +26,7 @@ type AnimeRow = {
   banner_url: string | null
   format: string | null
   otaku_anime_id: number | null
+  otaku_video_id: number | null
   exported_to_otaku: boolean
   export_attempts: number
 }
@@ -117,7 +118,7 @@ export async function GET() {
   const supabase = createAdminClient()
   const { data: rows, error } = await supabase
     .from('episodes')
-    .select('play_id, anilist_id, mal_id, episode_number, title, description, image_url, air_date, duration, export_attempts')
+    .select('anilist_id, mal_id, title, description, cover_url, genres, status, release_year, studio, poster_url, banner_url, format, otaku_anime_id, otaku_video_id, exported_to_otaku, export_attempts')
     .eq('exported_to_otaku', false)
     .lt('export_attempts', 5)
     .or('sub_providers.neq.[],dub_providers.neq.[]')
@@ -142,45 +143,79 @@ export async function GET() {
 
     const animeRow = anime as AnimeRow
     const videoFormat = ['MOVIE', 'OVA', 'SPECIAL'].includes((animeRow.format ?? '').toUpperCase())
+    
     if (videoFormat) {
       try {
-        const result = await postOtaku('/api/play/videos', {
-          anilistId: animeRow.anilist_id,
-          malId: episode.mal_id ?? animeRow.mal_id,
-          title: decodeHtml(animeRow.title),
-          description: decodeHtml(animeRow.description),
-          coverUrl: animeRow.cover_url,
-          genres: animeRow.genres,
-          status: animeRow.status,
-          releaseYear: animeRow.release_year,
-          studioName: animeRow.studio,
-          contentType: (animeRow.format as string).toLowerCase(),
-          episodeTitle: decodeHtml(episode.title),
-          episodeDescription: decodeHtml(episode.description),
-          thumbnailUrl: episode.image_url,
-          airDate: episode.air_date,
-          duration: episode.duration,
-          playId: episode.play_id,
-        })
-        if (![200, 201].includes(result.response.status) || typeof result.payload.videoId !== 'number') throw new Error(`Video export HTTP ${result.response.status}`)
-        
-const { error: saveVideoError } = await supabase
-  .from('anime')
-  .update({
-    otaku_video_id: result.payload.videoId,
-    exported_to_otaku: true,
-    last_export_error: null,
-  })
-  .eq('anilist_id', animeRow.anilist_id)
+        let videoId = animeRow.otaku_video_id
 
-if (saveVideoError) throw saveVideoError
-episodesExported += 1
+        if (videoId == null) {
+          const result = await postOtaku('/api/play/videos', {
+            anilistId: animeRow.anilist_id,
+            malId: episode.mal_id ?? animeRow.mal_id,
+            title: decodeHtml(animeRow.title),
+            description: decodeHtml(animeRow.description),
+            coverUrl: animeRow.cover_url,
+            genres: animeRow.genres,
+            status: animeRow.status,
+            releaseYear: animeRow.release_year,
+            studioName: animeRow.studio,
+            contentType: (animeRow.format as string).toLowerCase(),
+            episodeTitle: decodeHtml(episode.title),
+            episodeDescription: decodeHtml(episode.description),
+            thumbnailUrl: episode.image_url,
+            airDate: episode.air_date,
+            duration: episode.duration,
+            playId: episode.play_id,
+          })
+
+          if (
+            ![200, 201].includes(result.response.status) ||
+            typeof result.payload.videoId !== 'number'
+          ) {
+            throw new Error(`Video export HTTP ${result.response.status}`)
+          }
+
+          videoId = result.payload.videoId
+
+          const { error: saveVideoError } = await supabase
+            .from('anime')
+            .update({
+              otaku_video_id: videoId,
+              exported_to_otaku: true,
+              last_export_error: null,
+            })
+            .eq('anilist_id', animeRow.anilist_id)
+
+          if (saveVideoError) throw saveVideoError
+        }
+
+        // Mark the source queue row complete without storing a video ID
+        // in episodes.otaku_episode_id.
+        const { error: saveQueueError } = await supabase
+          .from('episodes')
+          .update({
+            exported_to_otaku: true,
+            last_export_error: null,
+          })
+          .eq('play_id', episode.play_id)
+
+        if (saveQueueError) throw saveQueueError
+
+        episodesExported += 1
       } catch (error) {
         const attempts = episode.export_attempts + 1
-        await updateAttempt(supabase, 'episodes', episode.play_id, attempts, shortError(error))
+        await updateAttempt(
+          supabase,
+          'episodes',
+          episode.play_id,
+          attempts,
+          shortError(error)
+        )
+
         if (attempts >= 5) episodesFailed += 1
         else episodesRetrying += 1
       }
+
       continue
     }
 

@@ -9,9 +9,8 @@ const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
 const JIKAN_BASE_URL = 'https://api.jikan.moe/v4'
 
 const PROVIDERS = [
-  'mkissa', 'reanime', 'anikoto', 'animegg', 'anineko', 'anidbapp',
-  'animenosub', 'anizone', 'aniwaves', 'anibd', 'senshi', 'kaa',
-  'animedunya', 'animeonsen',
+  'mkissa', 'reanime', 'anikoto', 'animegg', 'animenosub', 'anizone',
+  'aniwaves', 'senshi', 'kaa', 'animedunya', 'animeonsen', 'anipm',
 ] as const
 
 const BATCH_SIZE = 10

@@ -9,8 +9,8 @@ const ANIVEXA_TIMEOUT_MS = 40_000
 const BATCH_SIZE = 30
 const START_BUDGET_MS = 45_000
 const PROVIDERS = [
-  'mkissa', 'reanime', 'anikoto', 'animegg', 'anineko', 'anidbapp', 'animenosub',
-  'anizone', 'aniwaves', 'anibd', 'senshi', 'kaa', 'animedunya', 'animeonsen',
+  'mkissa', 'reanime', 'anikoto', 'animegg', 'animenosub', 'anizone',
+  'aniwaves', 'senshi', 'kaa', 'animedunya', 'animeonsen', 'anipm',
 ] as const
 
 type ProviderEpisode = { id?: string; number?: number }

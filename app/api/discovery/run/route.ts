@@ -64,7 +64,7 @@ export async function GET() {
     const catalogEntries = []
     let catalogPagesFetched = 0
     let catalogEntriesSeen = 0
-    const catalogCutoff = now - 7 * 86400
+    const catalogCutoff = now - 30 * 86400
 
     for (let page = 1; page <= 3; page += 1) {
       let response: Response
@@ -91,11 +91,11 @@ export async function GET() {
       })
       catalogEntries.push(...recentMedia.map((media) => ({ anilist_id: media.id, episode_number: 1 })))
 
-      const pageIsOlderThanSevenDays = catalog.media.length > 0 && catalog.media.every((media) => {
+      const pageIsOlderThanThirtyDays = catalog.media.length > 0 && catalog.media.every((media) => {
         const { year, month, day } = media.startDate ?? {}
         return !year || !month || !day || Math.floor(Date.UTC(year, month - 1, day) / 1000) < catalogCutoff
       })
-      if (!catalog.hasNextPage || pageIsOlderThanSevenDays || page === 3) break
+      if (!catalog.hasNextPage || pageIsOlderThanThirtyDays || page === 3) break
       if (responseHeaders && shouldPauseBeforeNextPage(responseHeaders)) await sleep(getWaitSeconds(responseHeaders))
     }
 

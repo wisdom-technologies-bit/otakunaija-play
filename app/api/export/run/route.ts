@@ -14,6 +14,7 @@ let lastJikanCallAt = 0
 
 type AnimeRow = {
   anilist_id: number
+  mal_id: number | null
   title: string
   description: string | null
   cover_url: string | null
@@ -23,6 +24,7 @@ type AnimeRow = {
   studio: string | null
   poster_url: string | null
   banner_url: string | null
+  format: string | null
   otaku_anime_id: number | null
   exported_to_otaku: boolean
   export_attempts: number
@@ -31,6 +33,7 @@ type AnimeRow = {
 type EpisodeRow = {
   play_id: string
   anilist_id: number
+  mal_id: number | null
   episode_number: number
   title: string | null
   description: string | null
@@ -114,7 +117,7 @@ export async function GET() {
   const supabase = createAdminClient()
   const { data: rows, error } = await supabase
     .from('episodes')
-    .select('play_id, anilist_id, episode_number, title, description, image_url, air_date, duration, export_attempts')
+    .select('play_id, anilist_id, mal_id, episode_number, title, description, image_url, air_date, duration, export_attempts')
     .eq('exported_to_otaku', false)
     .lt('export_attempts', 5)
     .or('sub_providers.neq.[],dub_providers.neq.[]')
@@ -131,13 +134,47 @@ export async function GET() {
 
   for (const episode of rows as EpisodeRow[]) {
     if (Date.now() - startedAt >= TIME_BUDGET_MS) break
-    const { data: anime, error: animeLookupError } = await supabase.from('anime').select('anilist_id, title, description, cover_url, genres, status, release_year, studio, poster_url, banner_url, otaku_anime_id, exported_to_otaku, export_attempts').eq('anilist_id', episode.anilist_id).maybeSingle()
+    const { data: anime, error: animeLookupError } = await supabase.from('anime').select('anilist_id, mal_id, title, description, cover_url, genres, status, release_year, studio, poster_url, banner_url, format, otaku_anime_id, exported_to_otaku, export_attempts').eq('anilist_id', episode.anilist_id).maybeSingle()
     if (animeLookupError || !anime) {
       episodesBlockedByAnime += 1
       continue
     }
 
     const animeRow = anime as AnimeRow
+    const videoFormat = ['MOVIE', 'OVA', 'SPECIAL'].includes((animeRow.format ?? '').toUpperCase())
+    if (videoFormat) {
+      try {
+        const result = await postOtaku('/api/play/videos', {
+          anilistId: animeRow.anilist_id,
+          malId: episode.mal_id ?? animeRow.mal_id,
+          title: decodeHtml(animeRow.title),
+          description: decodeHtml(animeRow.description),
+          coverUrl: animeRow.cover_url,
+          genres: animeRow.genres,
+          status: animeRow.status,
+          releaseYear: animeRow.release_year,
+          studioName: animeRow.studio,
+          contentType: (animeRow.format as string).toLowerCase(),
+          episodeTitle: decodeHtml(episode.title),
+          episodeDescription: decodeHtml(episode.description),
+          thumbnailUrl: episode.image_url,
+          airDate: episode.air_date,
+          duration: episode.duration,
+          playId: episode.play_id,
+        })
+        if (![200, 201].includes(result.response.status) || typeof result.payload.videoId !== 'number') throw new Error(`Video export HTTP ${result.response.status}`)
+        const { error: saveEpisodeError } = await supabase.from('episodes').update({ otaku_episode_id: result.payload.videoId, exported_to_otaku: true, last_export_error: null }).eq('play_id', episode.play_id)
+        if (saveEpisodeError) throw saveEpisodeError
+        episodesExported += 1
+      } catch (error) {
+        const attempts = episode.export_attempts + 1
+        await updateAttempt(supabase, 'episodes', episode.play_id, attempts, shortError(error))
+        if (attempts >= 5) episodesFailed += 1
+        else episodesRetrying += 1
+      }
+      continue
+    }
+
     if (animeRow.otaku_anime_id == null) {
       try {
         const result = await postOtaku('/api/play/anime', {

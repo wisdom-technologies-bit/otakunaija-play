@@ -12,7 +12,7 @@ const ALLOWED_FORMATS = new Set(['MOVIE', 'OVA', 'SPECIAL'])
 
 type Mapping = { anilistId?: number | null; type?: string | null; format?: string | null }
 type Payload = { mappings?: { franchise?: Mapping[] | null } | null }
-type Anime = { id: number; anilist_id: number }
+type Anime = { anilist_id: number }
 
 async function fetchMapping(anilistId: number) {
   const controller = new AbortController()
@@ -36,7 +36,7 @@ export async function GET(request: Request) {
   const supabase = createAdminClient()
   const { data: selected, error } = await supabase
     .from('anime')
-    .select('id, anilist_id')
+    .select('anilist_id')
     .is('franchise_checked_at', null)
     .order('anilist_id', { ascending: true })
     .limit(BATCH_SIZE)
@@ -71,7 +71,7 @@ export async function GET(request: Request) {
         if (insertError) throw insertError
         pendingSyncInserted += data?.length ?? 0
       }
-      const { error: markError } = await supabase.from('anime').update({ franchise_checked_at: new Date().toISOString() }).eq('id', anime.id)
+      const { error: markError } = await supabase.from('anime').update({ franchise_checked_at: new Date().toISOString() }).eq('anilist_id', anime.anilist_id)
       if (markError) throw markError
       animeChecked += 1
     } catch (error) {

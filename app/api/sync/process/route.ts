@@ -34,7 +34,13 @@ type AnivexaProvider = {
 }
 
 type AnivexaResponse = {
-  mappings?: { malId?: number | null; title?: string }
+  mappings?: {
+    malId?: number | null
+    title?: string | null
+    type?: string | null
+    format?: string | null
+    episodes?: number | null
+  }
   [key: string]: unknown
 }
 
@@ -190,7 +196,28 @@ export async function GET() {
       const dubProviders: Array<{ provider: string; episodeId: string }> = []
       let firstSubMatch: ProviderEpisode | null = null
       let firstDubMatch: ProviderEpisode | null = null
+      
 
+const allowedFormats = [
+  'TV',
+  'TV_SHORT',
+  'MOVIE',
+  'OVA',
+  'SPECIAL',
+  'ONA',
+  'MUSIC',
+] as const
+
+const rawFormat = mappings.format ?? mappings.type
+
+const animeFormat =
+  typeof rawFormat === 'string' &&
+  allowedFormats.includes(
+    rawFormat.toUpperCase() as (typeof allowedFormats)[number]
+  )
+    ? rawFormat.toUpperCase()
+    : null
+      
       for (const providerName of PROVIDERS) {
         const provider = payload[providerName] as AnivexaProvider | undefined
         if (!provider || provider.error) continue
@@ -206,30 +233,93 @@ export async function GET() {
         }
       }
 
-      const metadata = firstSubMatch ?? firstDubMatch
-      const hasUsableMetadata = Boolean(
-        metadata && (
-          metadata.title != null ||
-          metadata.description != null ||
-          metadata.image != null ||
-          metadata.airDate != null ||
-          (metadata.duration != null && metadata.duration > 0) ||
-          metadata.filler === true ||
-          metadata.recap === true
-        ),
-      )
-      if (!hasUsableMetadata) throw new Error('Anivexa returned no usable episode metadata')
+      
+const metadata = firstSubMatch ?? firstDubMatch
 
-      const { data: existingAnime, error: animeLookupError } = await supabase
-        .from('anime').select('anilist_id').eq('anilist_id', row.anilist_id).maybeSingle()
-      if (animeLookupError) throw animeLookupError
+const { data: existingAnime, error: existingAnimeError } = await supabase
+  .from('anime')
+  .select('anilist_id, format')
+  .eq('anilist_id', row.anilist_id)
+  .maybeSingle()
+
+if (existingAnimeError) {
+  throw existingAnimeError
+}
+
+if (
+  existingAnime &&
+  animeFormat &&
+  existingAnime.format?.toUpperCase() !== animeFormat
+) {
+  const { error: updateAnimeError } = await supabase
+    .from('anime')
+    .update({ format: animeFormat })
+    .eq('anilist_id', row.anilist_id)
+
+  if (updateAnimeError) {
+    throw updateAnimeError
+  }
+}
+
+const hasUsableMetadata = Boolean(
+  metadata && (
+    metadata.title != null ||
+    metadata.description != null ||
+    metadata.image != null ||
+    metadata.airDate != null ||
+    (metadata.duration != null && metadata.duration > 0) ||
+    metadata.filler === true ||
+    metadata.recap === true
+  ),
+)
+
+if (!hasUsableMetadata) {
+  if (existingAnime || animeFormat) {
+    await supabase
+      .from('pending_sync')
+      .update({
+        status: 'done',
+        processed_at: new Date().toISOString(),
+        last_error: null,
+      })
+      .eq('id', row.id)
+
+    rowsCompleted += 1
+    continue
+  }
+
+  throw new Error('Anivexa returned no usable episode metadata')
+}
       if (!existingAnime) {
-        let anime = { anilist_id: row.anilist_id, mal_id: malId, title: animeTitle, description: null as string | null, cover_url: null as string | null, poster_url: null as string | null, banner_url: null as string | null, format: null as string | null, genres: null as string[] | null, status: null as string | null, release_year: null as number | null, studio: null as string | null }
+        
+let anime = {
+  anilist_id: row.anilist_id,
+  mal_id: malId,
+  title: animeTitle,
+  description: null as string | null,
+  cover_url: null as string | null,
+  poster_url: null as string | null,
+  banner_url: null as string | null,
+  format: animeFormat,
+  genres: null as string[] | null,
+  status: null as string | null,
+  release_year: null as number | null,
+  studio: null as string | null,
+}
         if (malId !== null) {
           try {
             const jikan = await fetchJikan(malId)
             const data = jikan.data
-            anime = { ...anime, title: data?.title || animeTitle, description: data?.synopsis ?? null, cover_url: data?.images?.jpg?.large_image_url ?? null, format: typeof data?.type === 'string' && ['TV', 'MOVIE', 'OVA', 'SPECIAL', 'ONA', 'MUSIC'].includes(data.type.toUpperCase()) ? data.type.toUpperCase() : null, genres: data?.genres?.map((genre) => genre.name).filter((name): name is string => Boolean(name)) ?? [], status: data?.status ?? null, release_year: data?.year ?? data?.aired?.prop?.from?.year ?? null, studio: data?.studios?.[0]?.name ?? null }
+            anime = { ...anime, title: data?.title || animeTitle, description: data?.synopsis ?? null, cover_url: data?.images?.jpg?.large_image_url ?? null, 
+format: animeFormat ?? (
+  typeof data?.type === 'string' &&
+  ['TV', 'MOVIE', 'OVA', 'SPECIAL', 'ONA', 'MUSIC'].includes(
+    data.type.toUpperCase()
+  )
+    ? data.type.toUpperCase()
+    : null
+),
+ genres: data?.genres?.map((genre) => genre.name).filter((name): name is string => Boolean(name)) ?? [], status: data?.status ?? null, release_year: data?.year ?? data?.aired?.prop?.from?.year ?? null, studio: data?.studios?.[0]?.name ?? null }
           } catch {
             // The requested fallback is the minimal anime row.
           }

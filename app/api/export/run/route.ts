@@ -163,9 +163,18 @@ export async function GET() {
           playId: episode.play_id,
         })
         if (![200, 201].includes(result.response.status) || typeof result.payload.videoId !== 'number') throw new Error(`Video export HTTP ${result.response.status}`)
-        const { error: saveEpisodeError } = await supabase.from('episodes').update({ otaku_episode_id: result.payload.videoId, exported_to_otaku: true, last_export_error: null }).eq('play_id', episode.play_id)
-        if (saveEpisodeError) throw saveEpisodeError
-        episodesExported += 1
+        
+const { error: saveVideoError } = await supabase
+  .from('anime')
+  .update({
+    otaku_video_id: result.payload.videoId,
+    exported_to_otaku: true,
+    last_export_error: null,
+  })
+  .eq('anilist_id', animeRow.anilist_id)
+
+if (saveVideoError) throw saveVideoError
+episodesExported += 1
       } catch (error) {
         const attempts = episode.export_attempts + 1
         await updateAttempt(supabase, 'episodes', episode.play_id, attempts, shortError(error))

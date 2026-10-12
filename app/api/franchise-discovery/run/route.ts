@@ -38,7 +38,7 @@ export async function GET(request: Request) {
     .from('anime')
     .select('id, anilist_id')
     .is('franchise_checked_at', null)
-    .order('id', { ascending: true })
+    .order('anilist_id', { ascending: true })
     .limit(BATCH_SIZE)
 
   if (error) return Response.json({ error: error.message }, { status: 500 })

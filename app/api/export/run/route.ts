@@ -117,13 +117,13 @@ export async function GET() {
   const startedAt = Date.now()
   const supabase = createAdminClient()
   const { data: rows, error } = await supabase
-    .from('episodes')
-    .select('anilist_id, mal_id, title, description, cover_url, genres, status, release_year, studio, poster_url, banner_url, format, otaku_anime_id, otaku_video_id, exported_to_otaku, export_attempts')
-    .eq('exported_to_otaku', false)
-    .lt('export_attempts', 5)
-    .or('sub_providers.neq.[],dub_providers.neq.[]')
-    .order('created_at', { ascending: true })
-    .limit(BATCH_SIZE)
+  .from('episodes')
+  .select('play_id, anilist_id, mal_id, episode_number, title, description, image_url, air_date, duration, exported_to_otaku, export_attempts, sub_providers, dub_providers')
+  .eq('exported_to_otaku', false)
+  .lt('export_attempts', 5)
+  .or('sub_providers.neq.[],dub_providers.neq.[]')
+  .order('created_at', { ascending: true })
+  .limit(BATCH_SIZE)
 
   if (error) return Response.json({ error: error.message }, { status: 500 })
   if (!rows?.length) return Response.json({ processed: 0, message: 'nothing to export' })
@@ -135,7 +135,11 @@ export async function GET() {
 
   for (const episode of rows as EpisodeRow[]) {
     if (Date.now() - startedAt >= TIME_BUDGET_MS) break
-    const { data: anime, error: animeLookupError } = await supabase.from('anime').select('anilist_id, mal_id, title, description, cover_url, genres, status, release_year, studio, poster_url, banner_url, format, otaku_anime_id, exported_to_otaku, export_attempts').eq('anilist_id', episode.anilist_id).maybeSingle()
+    const { data: anime, error: animeLookupError } = await supabase
+  .from('anime')
+  .select('anilist_id, mal_id, title, description, cover_url, genres, status, release_year, studio, poster_url, banner_url, format, otaku_anime_id, otaku_video_id, exported_to_otaku, export_attempts')
+  .eq('anilist_id', episode.anilist_id)
+  .maybeSingle()
     if (animeLookupError || !anime) {
       episodesBlockedByAnime += 1
       continue

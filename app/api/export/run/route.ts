@@ -122,7 +122,7 @@ export async function GET() {
   .eq('exported_to_otaku', false)
   .lt('export_attempts', 5)
   .or('sub_providers.neq.[],dub_providers.neq.[]')
-  .order('created_at', { ascending: true })
+  .order('created_at', { ascending: false })
   .limit(BATCH_SIZE)
 
   if (error) return Response.json({ error: error.message }, { status: 500 })

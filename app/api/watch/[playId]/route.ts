@@ -3,7 +3,7 @@ import { signProxyUrl } from '@/lib/proxy-signing'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 45
+export const maxDuration = 240
 
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
 const REQUEST_TIMEOUT_MS = 25_000

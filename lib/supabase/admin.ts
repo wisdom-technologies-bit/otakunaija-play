@@ -39,6 +39,24 @@ export type AniListResponse = {
   errors?: Array<{ message?: string }>
 }
 
+export type CatalogMedia = {
+  id: number
+  idMal?: number | null
+  format?: string | null
+  startDate?: { year?: number | null; month?: number | null; day?: number | null } | null
+  title?: { romaji?: string | null } | null
+}
+
+export type AniListCatalogResponse = {
+  data?: {
+    Page?: {
+      pageInfo?: { hasNextPage?: boolean }
+      media?: CatalogMedia[]
+    }
+  }
+  errors?: Array<{ message?: string }>
+}
+
 export async function insertPendingSync(entries: PendingSyncEntry[]) {
   if (entries.length === 0) return 0
 
@@ -74,6 +92,40 @@ export async function findExistingPendingSyncEntries(entries: PendingSyncEntry[]
 
 export function pendingSyncKey(entry: PendingSyncEntry) {
   return `${entry.anilist_id}-${entry.episode_number}`
+}
+
+export async function fetchAniListCatalogPage(page: number) {
+  return fetch('https://graphql.anilist.co', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      query: `query ($page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage }
+    media(sort: START_DATE_DESC, type: ANIME) {
+      id
+      idMal
+      format
+      startDate { year month day }
+      title { romaji }
+    }
+  }
+}`,
+      variables: { page, perPage: 50 },
+    }),
+    cache: 'no-store',
+  })
+}
+
+export function parseAniListCatalogResponse(payload: AniListCatalogResponse) {
+  if (payload.errors?.length) {
+    throw new Error(payload.errors.map((error) => error.message ?? 'AniList error').join('; '))
+  }
+
+  return {
+    hasNextPage: payload.data?.Page?.pageInfo?.hasNextPage ?? false,
+    media: payload.data?.Page?.media ?? [],
+  }
 }
 
 export async function fetchAniListPage(page: number, now: number) {

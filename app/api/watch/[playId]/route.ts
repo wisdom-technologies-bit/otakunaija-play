@@ -72,11 +72,12 @@ async function fetchWatch(episodeId: string): Promise<WatchResponse | null> {
   }
 }
 
-function qualify(body: WatchResponse | null, requireSubtitle: boolean): NormalizedStream | null {
+function qualify(body: WatchResponse | null, requireSubtitle: boolean, providerName: string, excluded: Set<string>): NormalizedStream | null {
   if (!body || 'error' in body || !Array.isArray(body.streams) || body.streams.length === 0) return null
   const candidates = body.streams.filter((entry) =>
     typeof entry?.url === 'string' && entry.url.length > 0 &&
-    (!requireSubtitle || (Array.isArray(entry.subtitles) && entry.subtitles.some((subtitle) => typeof subtitle?.url === 'string' && subtitle.url.length > 0))),
+    (!requireSubtitle || (Array.isArray(entry.subtitles) && entry.subtitles.some((subtitle) => typeof subtitle?.url === 'string' && subtitle.url.length > 0))) &&
+    !excluded.has(`${providerName}:${entry.server ?? 'default'}`),
   )
   if (candidates.length === 0) return null
   const active = candidates.filter((entry) => entry.isActive === true)
@@ -127,12 +128,12 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
   }
 }
 
-async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean) {
+async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>) {
   const responses = await Promise.allSettled(entries.map((entry) => fetchWatch(entry.episodeId ?? '')))
   for (let index = 0; index < entries.length; index += 1) {
     const settled = responses[index]
     if (settled.status === 'fulfilled') {
-      const stream = qualify(settled.value, requireSubtitle)
+      const stream = qualify(settled.value, requireSubtitle, entries[index].provider ?? '', excluded)
       if (stream) return { provider: entries[index].provider ?? '', stream }
     }
   }
@@ -155,15 +156,19 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   if (error) return json({ error: 'LOOKUP_FAILED' }, 500)
   if (!episode) return json({ error: 'EPISODE_NOT_FOUND' }, 404)
 
+  const excludeParam = new URL(_request.url).searchParams.get('exclude') ?? ''
+  const excluded = new Set(excludeParam.split(',').map((value) => value.trim()).filter(Boolean))
+  const hasExclusions = excluded.size > 0
+
   const subProviders = episode.sub_providers ?? []
   const dubProviders = episode.dub_providers ?? []
   if (subProviders.length === 0 && dubProviders.length === 0) return json({ error: 'NO_PROVIDERS_AVAILABLE' }, 404)
 
-  if (episode.resolved_provider && episode.resolved_audio && episode.resolved_at && ageMs(episode.resolved_at) < 6 * 60 * 60 * 1000) {
+  if (!hasExclusions && episode.resolved_provider && episode.resolved_audio && episode.resolved_at && ageMs(episode.resolved_at) < 6 * 60 * 60 * 1000) {
     const entries = episode.resolved_audio === 'sub' ? subProviders : dubProviders
     const cached = entries.find((entry) => entry.provider === episode.resolved_provider)
     if (cached?.episodeId) {
-      const stream = qualify(await fetchWatch(cached.episodeId), episode.resolved_audio === 'sub')
+      const stream = qualify(await fetchWatch(cached.episodeId), episode.resolved_audio === 'sub', episode.resolved_provider, excluded)
       if (stream) {
         if (episode.needs_resync) {
           const { error: resyncClearError } = await supabase.from('episodes').update({ needs_resync: false, resync_requested_at: null }).eq('play_id', playId)
@@ -174,8 +179,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     }
   }
 
-  const subWinner = subProviders.length > 0 ? await findWinner(subProviders, true) : null
-  const dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false) : null
+  const subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded) : null
+  const dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded) : null
   const winner = subWinner
     ? { audio: 'sub' as const, provider: subWinner.provider, stream: subWinner.stream }
     : dubWinner

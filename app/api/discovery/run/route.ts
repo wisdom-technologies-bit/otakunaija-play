@@ -54,10 +54,7 @@ export async function GET() {
       pagesFetched += 1
       collected.push(...parsed.schedules)
 
-      const pageIsOlderThanOneDay =
-        parsed.schedules.length > 0 && parsed.schedules.every((schedule) => isOlderThanOneDay(schedule, now))
-
-      if (!parsed.hasNextPage || pageIsOlderThanOneDay || page === MAX_PAGES) break
+      if (!parsed.hasNextPage || page === MAX_PAGES) break
       if (shouldPauseBeforeNextPage(headers)) await sleep(getWaitSeconds(headers))
     }
 

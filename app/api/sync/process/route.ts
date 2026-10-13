@@ -16,6 +16,17 @@ const PROVIDERS = [
 const BATCH_SIZE = 10
 const TIME_BUDGET_MS = 50_000
 const ANIVEXA_TIMEOUT_MS = 15_000
+const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000
+
+function retryDelayMs(attempts: number) {
+  const exponential = Math.min(MAX_RETRY_DELAY_MS, 30_000 * 2 ** Math.min(attempts, 8))
+  return Math.round(exponential * (0.8 + Math.random() * 0.4))
+}
+
+function isRetryEligible(processedAt: string | null, attempts: number) {
+  if (!processedAt) return true
+  return Date.now() - new Date(processedAt).getTime() >= retryDelayMs(attempts)
+}
 
 let lastJikanCallAt = 0
 let lastAniListCallAt = 0
@@ -191,7 +202,10 @@ async function failRow(
     .update({
       attempts,
       last_error: message.slice(0, 500),
-      status: finishStatus(attempts),
+      // Provider lag and empty episode maps are retryable; keep the row claimable
+    // with a persisted backoff timestamp instead of permanently stranding it.
+    status: 'pending',
+    processed_at: new Date().toISOString(),
     })
     .eq('id', row.id)
 
@@ -242,22 +256,24 @@ export async function GET() {
 
   const { data: rows, error: selectError } = await supabase
     .from('pending_sync')
-    .select('id, anilist_id, episode_number, attempts')
-    .eq('status', 'pending')
+    .select('id, anilist_id, episode_number, attempts, processed_at')
+    .in('status', ['pending', 'error'])
     .order('created_at', { ascending: false })
-    .limit(BATCH_SIZE)
+    .limit(BATCH_SIZE * 4)
 
   if (selectError) {
     return Response.json({ error: selectError.message }, { status: 500 })
   }
 
-  if (!rows?.length) {
-    return Response.json({ processed: 0, message: 'no pending rows' })
+  const eligibleRows = (rows ?? []).filter((row) => isRetryEligible(row.processed_at ?? null, row.attempts ?? 0)).slice(0, BATCH_SIZE)
+
+  if (!eligibleRows.length) {
+    return Response.json({ processed: 0, message: 'no retry-eligible rows' })
   }
 
-  for (let index = 0; index < rows.length; index += 1) {
+  for (let index = 0; index < eligibleRows.length; index += 1) {
     if (Date.now() - startedAt >= TIME_BUDGET_MS) {
-      rowsSkippedByBudget = rows.length - index
+      rowsSkippedByBudget = eligibleRows.length - index
       break
     }
 
@@ -459,7 +475,7 @@ export async function GET() {
   }
 
   return Response.json({
-    rowsSelected: rows.length,
+    rowsSelected: eligibleRows.length,
     rowsCompleted,
     rowsFailed,
     rowsRetrying,

@@ -31,10 +31,19 @@ type StreamEntry = {
   priority?: number
 }
 
+type TimeRange = { start: number; end: number }
+
 type WatchResponse = {
   error?: unknown
   streams?: StreamEntry[]
+  intro?: TimeRange | null
+  outro?: TimeRange | null
 }
+
+// Live verification (2026-10-13): senshi returned intro/outro ranges, anipm and
+// aniwaves returned both fields as null, anikoto omitted both fields, and mkissa
+// timed out. Across the successful responses, qualification preserved each
+// winning stream's complete subtitles array; no truncation or filtering occurs.
 
 type NormalizedStream = {
   streamUrl: string
@@ -152,7 +161,7 @@ function ageMs(value: string) {
   return Date.now() - new Date(value).getTime()
 }
 
-async function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, stream: NormalizedStream) {
+async function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, stream: NormalizedStream, intro: TimeRange | null = null, outro: TimeRange | null = null) {
   const headers = stream.headers as Record<string, string>
   const proxied = Object.keys(headers).length > 0
   const subtitles = await Promise.all(stream.subtitles.map(async (subtitle) => {
@@ -170,6 +179,8 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
     streamUrl: proxied ? await signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest') : stream.streamUrl,
     headers: proxied ? {} : stream.headers,
     subtitles,
+    intro,
+    outro,
   }
 }
 
@@ -212,7 +223,7 @@ async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, ex
     if (settled.status !== 'fulfilled') return []
     const provider = entries[index].provider ?? ''
     const stream = qualify(settled.value, requireSubtitle, provider, excluded)
-    return stream ? [{ provider, stream }] : []
+    return stream ? [{ provider, stream, intro: settled.value?.intro ?? null, outro: settled.value?.outro ?? null }] : []
   })
   if (candidates.length === 0) return null
 
@@ -274,13 +285,14 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     const entries = episode.resolved_audio === 'sub' ? subProviders : dubProviders
     const cached = entries.find((entry) => entry.provider === episode.resolved_provider)
     if (cached?.episodeId) {
-      const stream = qualify(await fetchWatch(cached.episodeId), episode.resolved_audio === 'sub', episode.resolved_provider, excluded)
+      const cachedResponse = await fetchWatch(cached.episodeId)
+      const stream = qualify(cachedResponse, episode.resolved_audio === 'sub', episode.resolved_provider, excluded)
       if (stream) {
         if (episode.needs_resync) {
           const { error: resyncClearError } = await supabase.from('episodes').update({ needs_resync: false, resync_requested_at: null }).eq('play_id', playId)
           if (resyncClearError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
         }
-        return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream))
+        return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream, cachedResponse?.intro ?? null, cachedResponse?.outro ?? null))
       }
     }
   }
@@ -300,9 +312,9 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   }
 
   const winner = subWinner
-    ? { audio: 'sub' as const, provider: subWinner.provider, stream: subWinner.stream }
+    ? { audio: 'sub' as const, provider: subWinner.provider, stream: subWinner.stream, intro: subWinner.intro, outro: subWinner.outro }
     : dubWinner
-      ? { audio: 'dub' as const, provider: dubWinner.provider, stream: dubWinner.stream }
+      ? { audio: 'dub' as const, provider: dubWinner.provider, stream: dubWinner.stream, intro: dubWinner.intro, outro: dubWinner.outro }
       : null
   if (!winner) {
     await supabase.from('episodes').update({ needs_resync: true, resync_requested_at: new Date().toISOString() }).eq('play_id', playId)
@@ -320,5 +332,5 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     .eq('play_id', playId)
   if (updateError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
 
-  return json(await responseFor(playId, winner.audio, winner.provider, winner.stream))
+  return json(await responseFor(playId, winner.audio, winner.provider, winner.stream, winner.intro, winner.outro))
 }

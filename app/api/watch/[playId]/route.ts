@@ -243,8 +243,20 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     }
   }
 
-  const subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded) : null
-  const dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded) : null
+  let subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded) : null
+  let dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded) : null
+
+  // Provider availability can change without the episode row being resynced. If
+  // the stored providers fail, refresh the catalog and retry newly discovered
+  // providers (including Ani.pm) before declaring the episode unavailable.
+  if (!subWinner && !dubWinner) {
+    const discovered = providersFromCatalog(await fetchEpisodeCatalog(episode.anilist_id), episode.episode_number)
+    subProviders = mergeProviders(subProviders, discovered.sub)
+    dubProviders = mergeProviders(dubProviders, discovered.dub)
+    subWinner = await findWinner(subProviders, true, excluded)
+    dubWinner = !subWinner ? await findWinner(dubProviders, false, excluded) : null
+  }
+
   const winner = subWinner
     ? { audio: 'sub' as const, provider: subWinner.provider, stream: subWinner.stream }
     : dubWinner

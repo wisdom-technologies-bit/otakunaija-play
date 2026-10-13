@@ -43,6 +43,23 @@ async function fetchPageWithRetry(page: number, now: number) {
   throw new Error('Unable to fetch AniList page')
 }
 
+async function fetchAniPmAiring() {
+  const res = await fetch('https://ani.pm/api/anime/airing-week', {
+    headers: {
+      'user-agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36',
+      accept: 'application/json',
+    },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(10_000),
+  })
+  if (!res.ok) throw new Error(`ani.pm HTTP ${res.status}`)
+  const { items = [] } = await res.json()
+  return items
+    .filter((i: any) => i.onSite)
+    .map((i: any) => ({ anilist_id: Number(i.anilistId), episode_number: Number(i.episode) }))
+    .filter((e: any) => e.anilist_id > 0 && e.episode_number > 0)
+}
+
 export async function GET() {
   const now = getCurrentUnixTime()
   const collected = []
@@ -98,7 +115,14 @@ export async function GET() {
 
     const catalogPendingSyncInserted = await insertPendingSync(deduplicateEntries(catalogEntries))
     const allEntries = toPendingSyncEntries(collected)
-    const entries = deduplicateEntries(allEntries)
+    let aniPmEntries: { anilist_id: number; episode_number: number }[] = []
+    let aniPmError: string | null = null
+    try {
+      aniPmEntries = await fetchAniPmAiring()
+    } catch (e) {
+      aniPmError = getErrorMessage(e)
+    }
+    const entries = deduplicateEntries([...allEntries, ...aniPmEntries])
     const existingKeys = await findExistingPendingSyncEntries(entries)
     const deduplicatedKeys = new Set<string>()
     const seenKeys = new Set<string>()
@@ -146,6 +170,8 @@ export async function GET() {
       catalogPagesFetched,
       catalogEntriesSeen,
       catalogPendingSyncInserted,
+      anipmEntriesSeen: aniPmEntries.length,
+      anipmError: aniPmError,
       diagnostics: {
         counts: diagnosticCounts,
         schedules: diagnostics,

@@ -10,7 +10,7 @@ const JIKAN_BASE_URL = 'https://api.jikan.moe/v4'
 
 const PROVIDERS = [
   'mkissa', 'reanime', 'anikoto', 'animegg', 'animenosub', 'anizone',
-  'aniwaves', 'senshi', 'kaa', 'animedunya', 'animeonsen', 'anipm',
+  'aniwaves', 'senshi', 'kaa', 'animedunya', 'animeonsen', 'anipm', 'anibd',
 ] as const
 
 const BATCH_SIZE = 10

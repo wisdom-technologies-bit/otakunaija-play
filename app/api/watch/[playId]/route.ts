@@ -7,6 +7,12 @@ export const maxDuration = 240
 
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
 const REQUEST_TIMEOUT_MS = 25_000
+const EPISODE_LOOKUP_TIMEOUT_MS = 15_000
+
+const KNOWN_PROVIDERS = new Set([
+  'mkissa', 'reanime', 'anikoto', 'animegg', 'animenosub', 'anizone',
+  'aniwaves', 'senshi', 'kaa', 'animedunya', 'animeonsen', 'anipm', 'anibd',
+])
 
 type ProviderEntry = {
   provider?: string
@@ -39,6 +45,8 @@ type NormalizedStream = {
 
 type EpisodeRow = {
   play_id: string
+  anilist_id: number
+  episode_number: number
   sub_providers: ProviderEntry[] | null
   dub_providers: ProviderEntry[] | null
   resolved_provider: string | null
@@ -55,6 +63,42 @@ const corsHeaders = {
 
 function json(data: unknown, status = 200) {
   return Response.json(data, { status, headers: corsHeaders })
+}
+
+async function fetchEpisodeCatalog(anilistId: number): Promise<Record<string, unknown> | null> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), EPISODE_LOOKUP_TIMEOUT_MS)
+  try {
+    const response = await fetch(`${ANIVEXA_BASE_URL}/episodes/${anilistId}`, {
+      signal: controller.signal,
+      cache: 'no-store',
+    })
+    if (!response.ok) return null
+    const body: unknown = await response.json()
+    return body && typeof body === 'object' ? body as Record<string, unknown> : null
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function providersFromCatalog(catalog: Record<string, unknown> | null, episodeNumber: number) {
+  const sub: ProviderEntry[] = []
+  const dub: ProviderEntry[] = []
+  for (const [provider, value] of Object.entries(catalog ?? {})) {
+    if (!KNOWN_PROVIDERS.has(provider) || !value || typeof value !== 'object') continue
+    const episodes = (value as { episodes?: { sub?: unknown[]; dub?: unknown[] } }).episodes
+    for (const audio of ['sub', 'dub'] as const) {
+      const match = episodes?.[audio]?.find((entry) => {
+        if (!entry || typeof entry !== 'object') return false
+        const item = entry as { id?: unknown; number?: unknown }
+        return typeof item.id === 'string' && item.number === episodeNumber
+      }) as { id: string } | undefined
+      if (match) (audio === 'sub' ? sub : dub).push({ provider, episodeId: match.id })
+    }
+  }
+  return { sub, dub }
 }
 
 async function fetchWatch(episodeId: string): Promise<WatchResponse | null> {
@@ -149,7 +193,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   const supabase = createAdminClient()
   const { data: episode, error } = await supabase
     .from('episodes')
-    .select('play_id, sub_providers, dub_providers, resolved_provider, resolved_audio, resolved_at, needs_resync')
+    .select('play_id, anilist_id, episode_number, sub_providers, dub_providers, resolved_provider, resolved_audio, resolved_at, needs_resync')
     .eq('play_id', playId)
     .maybeSingle<EpisodeRow>()
 
@@ -160,8 +204,28 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   const excluded = new Set(excludeParam.split(',').map((value) => value.trim()).filter(Boolean))
   const hasExclusions = excluded.size > 0
 
-  const subProviders = episode.sub_providers ?? []
-  const dubProviders = episode.dub_providers ?? []
+  let subProviders = episode.sub_providers ?? []
+  let dubProviders = episode.dub_providers ?? []
+
+  const mergeProviders = (stored: ProviderEntry[], discoveredEntries: ProviderEntry[]) => {
+    const seen = new Set(stored.map((entry) => `${entry.provider}:${entry.episodeId}`))
+    return [...stored, ...discoveredEntries.filter((entry) => {
+      const key = `${entry.provider}:${entry.episodeId}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })]
+  }
+
+  // Only pay for the catalog lookup when the row has no usable provider data.
+  // This keeps normal watch requests fast while allowing newly added Anivexa
+  // providers to resolve episodes whose database record is empty.
+  if (subProviders.length === 0 && dubProviders.length === 0) {
+    const discovered = providersFromCatalog(await fetchEpisodeCatalog(episode.anilist_id), episode.episode_number)
+    subProviders = mergeProviders(subProviders, discovered.sub)
+    dubProviders = mergeProviders(dubProviders, discovered.dub)
+  }
+
   if (subProviders.length === 0 && dubProviders.length === 0) return json({ error: 'NO_PROVIDERS_AVAILABLE' }, 404)
 
   if (!hasExclusions && episode.resolved_provider && episode.resolved_audio && episode.resolved_at && ageMs(episode.resolved_at) < 6 * 60 * 60 * 1000) {

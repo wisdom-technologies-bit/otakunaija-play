@@ -6,8 +6,9 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 240
 
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
-const REQUEST_TIMEOUT_MS = 25_000
-const EPISODE_LOOKUP_TIMEOUT_MS = 15_000
+const REQUEST_TIMEOUT_MS = 12_000
+const EPISODE_LOOKUP_TIMEOUT_MS = 8_000
+const STREAM_PROBE_TIMEOUT_MS = 4_000
 
 const KNOWN_PROVIDERS = new Set([
   'mkissa', 'reanime', 'anikoto', 'animegg', 'animenosub', 'anizone',
@@ -172,16 +173,54 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
   }
 }
 
+async function probeStream(stream: NormalizedStream) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), STREAM_PROBE_TIMEOUT_MS)
+  try {
+    const headers = withProbeHeaders(stream.headers)
+    const response = await fetch(stream.streamUrl, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+      cache: 'no-store',
+    })
+    if (!response.ok) return false
+    if (stream.type !== 'hls' && !stream.streamUrl.toLowerCase().includes('.m3u8')) return true
+    const sample = await response.text()
+    return sample.includes('#EXTM3U')
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function withProbeHeaders(headers: Record<string, unknown>) {
+  const result: Record<string, string> = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value === 'string') result[key] = value
+  }
+  if (!Object.keys(result).some((key) => key.toLowerCase() === 'user-agent')) {
+    result['User-Agent'] = 'Mozilla/5.0'
+  }
+  return result
+}
+
 async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>) {
   const responses = await Promise.allSettled(entries.map((entry) => fetchWatch(entry.episodeId ?? '')))
-  for (let index = 0; index < entries.length; index += 1) {
-    const settled = responses[index]
-    if (settled.status === 'fulfilled') {
-      const stream = qualify(settled.value, requireSubtitle, entries[index].provider ?? '', excluded)
-      if (stream) return { provider: entries[index].provider ?? '', stream }
-    }
-  }
-  return null
+  const candidates = responses.flatMap((settled, index) => {
+    if (settled.status !== 'fulfilled') return []
+    const provider = entries[index].provider ?? ''
+    const stream = qualify(settled.value, requireSubtitle, provider, excluded)
+    return stream ? [{ provider, stream }] : []
+  })
+  if (candidates.length === 0) return null
+
+  const checked = await Promise.all(candidates.map(async (candidate) => ({
+    ...candidate,
+    usable: await probeStream(candidate.stream),
+  })))
+  return checked.find((candidate) => candidate.usable) ?? null
 }
 
 export async function OPTIONS() {

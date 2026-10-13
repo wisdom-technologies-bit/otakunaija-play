@@ -220,11 +220,14 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   // Only pay for the catalog lookup when the row has no usable provider data.
   // This keeps normal watch requests fast while allowing newly added Anivexa
   // providers to resolve episodes whose database record is empty.
-  if (subProviders.length === 0 && dubProviders.length === 0) {
-    const discovered = providersFromCatalog(await fetchEpisodeCatalog(episode.anilist_id), episode.episode_number)
-    subProviders = mergeProviders(subProviders, discovered.sub)
-    dubProviders = mergeProviders(dubProviders, discovered.dub)
+  // Ani.pm uses a deterministic episode id in Anivexa 2.3. Add it as a
+  // last-resort candidate even when the database/catalog does not list it.
+  // Anivexa will return an error quickly when that episode is unavailable.
+  const anipmFallback: ProviderEntry = {
+    provider: 'anipm',
+    episodeId: `watch/anipm/${episode.anilist_id}/sub/anipm-${episode.episode_number}`,
   }
+  subProviders = mergeProviders(subProviders, [anipmFallback])
 
   if (subProviders.length === 0 && dubProviders.length === 0) return json({ error: 'NO_PROVIDERS_AVAILABLE' }, 404)
 

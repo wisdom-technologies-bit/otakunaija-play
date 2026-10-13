@@ -52,7 +52,7 @@ async function fetchAniPmAiring() {
     cache: 'no-store',
     signal: AbortSignal.timeout(10_000),
   })
-  if (!res.ok) throw new Error(`ani.pm HTTP ${res.status}`)
+  if (!res.ok) throw new Error(`ani.pm HTTP ${res.status} ${res.headers.get('cf-mitigated') ?? ''}`.trim())
   const { items = [] } = await res.json()
   return items
     .filter((i: any) => i.onSite)

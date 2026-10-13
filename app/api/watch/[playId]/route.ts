@@ -10,6 +10,25 @@ const REQUEST_TIMEOUT_MS = 12_000
 const EPISODE_LOOKUP_TIMEOUT_MS = 8_000
 const STREAM_PROBE_TIMEOUT_MS = 4_000
 
+const SUBTITLE_LABEL_TO_SRCLANG: Record<string, string> = {
+  english: 'en',
+  'chinese (simplified)': 'zh-Hans',
+  'chinese (traditional)': 'zh-Hant',
+  korean: 'ko',
+  arabic: 'ar',
+  german: 'de',
+  spanish: 'es',
+  french: 'fr',
+  indonesian: 'id',
+  italian: 'it',
+  malay: 'ms',
+  polish: 'pl',
+  portuguese: 'pt',
+  russian: 'ru',
+  thai: 'th',
+  vietnamese: 'vi',
+}
+
 const KNOWN_PROVIDERS = new Set([
   'mkissa', 'reanime', 'anikoto', 'animegg', 'animenosub', 'anizone',
   'aniwaves', 'senshi', 'kaa', 'animedunya', 'animeonsen', 'anipm', 'anibd',
@@ -165,9 +184,12 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
   const headers = stream.headers as Record<string, string>
   const proxied = Object.keys(headers).length > 0
   const subtitles = await Promise.all(stream.subtitles.map(async (subtitle) => {
-    if (typeof subtitle.url !== 'string' || subtitle.url.length === 0) return subtitle
+    const label = typeof subtitle.label === 'string' ? subtitle.label.trim().toLowerCase() : null
+    const correctedSrclang = label ? SUBTITLE_LABEL_TO_SRCLANG[label] : undefined
+    const correctedSubtitle = correctedSrclang ? { ...subtitle, srclang: correctedSrclang } : subtitle
+    if (typeof subtitle.url !== 'string' || subtitle.url.length === 0) return correctedSubtitle
     return {
-      ...subtitle,
+      ...correctedSubtitle,
       url: await signProxyUrl(subtitle.url, headers, '/api/proxy/subtitle'),
     }
   }))

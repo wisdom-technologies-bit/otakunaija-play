@@ -9,8 +9,19 @@ const JIKAN_BASE_URL = 'https://api.jikan.moe/v4'
 const BATCH_SIZE = 10
 const TIME_BUDGET_MS = 50_000
 const REQUEST_TIMEOUT_MS = 10_000
+const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000
 
 let lastJikanCallAt = 0
+
+function retryDelayMs(attempts: number) {
+  const exponential = Math.min(MAX_RETRY_DELAY_MS, 30_000 * 2 ** Math.min(attempts, 8))
+  return Math.round(exponential * (0.8 + Math.random() * 0.4))
+}
+
+function isRetryEligible(updatedAt: string | null, attempts: number) {
+  if (!updatedAt) return true
+  return Date.now() - new Date(updatedAt).getTime() >= retryDelayMs(attempts)
+}
 
 type AnimeRow = {
   anilist_id: number
@@ -42,6 +53,7 @@ type EpisodeRow = {
   air_date: string | null
   duration: number | null
   export_attempts: number
+  updated_at: string | null
 }
 
 function decodeHtml(value: string | null | undefined): string | null {
@@ -67,7 +79,7 @@ function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function postOtaku(path: string, body: Record<string, unknown>) {
+async function postOtaku(path: string, body: Record<string, unknown>, retryCount = 0) {
   const baseUrl = process.env.OTAKUNAIJA_API_URL
   const apiKey = process.env.OTAKUNAIJA_API_KEY
   if (!baseUrl || !apiKey) throw new Error('OtakuNaija API credentials are not configured')
@@ -84,6 +96,12 @@ async function postOtaku(path: string, body: Record<string, unknown>) {
     })
     let payload: Record<string, unknown> = {}
     try { payload = await response.json() as Record<string, unknown> } catch { /* handled as an invalid response */ }
+    if ((response.status === 429 || response.status >= 500) && retryCount < 2) {
+      const retryAfter = Number(response.headers.get('retry-after'))
+      const delay = Number.isFinite(retryAfter) ? Math.min(60_000, retryAfter * 1000) : 1_000 + Math.random() * 2_000
+      await wait(delay)
+      return postOtaku(path, body, retryCount + 1)
+    }
     return { response, payload }
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') throw new Error('OtakuNaija request timed out')
@@ -108,7 +126,8 @@ async function fetchJikan(malId: number) {
 }
 
 async function updateAttempt(supabase: ReturnType<typeof createAdminClient>, table: 'anime' | 'episodes', key: string | number, attempts: number, message: string) {
-  const filter = table === 'anime' ? supabase.from(table).update({ export_attempts: attempts, last_export_error: message }).eq('anilist_id', key) : supabase.from(table).update({ export_attempts: attempts, last_export_error: message }).eq('play_id', key)
+  const update = { export_attempts: attempts, last_export_error: message, updated_at: new Date().toISOString() }
+  const filter = table === 'anime' ? supabase.from(table).update(update).eq('anilist_id', key) : supabase.from(table).update(update).eq('play_id', key)
   const { error } = await filter
   if (error) throw error
 }
@@ -118,22 +137,22 @@ export async function GET() {
   const supabase = createAdminClient()
   const { data: rows, error } = await supabase
   .from('episodes')
-  .select('play_id, anilist_id, mal_id, episode_number, title, description, image_url, air_date, duration, exported_to_otaku, export_attempts, sub_providers, dub_providers')
+  .select('play_id, anilist_id, mal_id, episode_number, title, description, image_url, air_date, duration, exported_to_otaku, export_attempts, sub_providers, dub_providers, updated_at')
   .eq('exported_to_otaku', false)
-  .lt('export_attempts', 5)
   .or('sub_providers.neq.[],dub_providers.neq.[]')
   .order('created_at', { ascending: false })
   .limit(BATCH_SIZE)
 
   if (error) return Response.json({ error: error.message }, { status: 500 })
-  if (!rows?.length) return Response.json({ processed: 0, message: 'nothing to export' })
+  const eligibleRows = (rows ?? []).filter((row) => isRetryEligible(row.updated_at ?? null, row.export_attempts ?? 0)).slice(0, BATCH_SIZE)
+  if (!eligibleRows.length) return Response.json({ processed: 0, message: 'no retry-eligible exports' })
 
   let episodesExported = 0
   let episodesBlockedByAnime = 0
   let episodesFailed = 0
   let episodesRetrying = 0
 
-  for (const episode of rows as EpisodeRow[]) {
+  for (const episode of eligibleRows as EpisodeRow[]) {
     if (Date.now() - startedAt >= TIME_BUDGET_MS) break
     const { data: anime, error: animeLookupError } = await supabase
   .from('anime')
@@ -273,6 +292,6 @@ export async function GET() {
     }
   }
 
-  return Response.json({ episodesSelected: rows.length, episodesExported, episodesBlockedByAnime, episodesFailed, episodesRetrying })
+  return Response.json({ episodesSelected: eligibleRows.length, episodesExported, episodesBlockedByAnime, episodesFailed, episodesRetrying })
 }
 

@@ -8,7 +8,7 @@ export const maxDuration = 240
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
 const REQUEST_TIMEOUT_MS = 12_000
 const EPISODE_LOOKUP_TIMEOUT_MS = 8_000
-const STREAM_PROBE_TIMEOUT_MS = 4_000
+const STREAM_PROBE_TIMEOUT_MS = 9_000
 
 const SUBTITLE_LABEL_TO_SRCLANG: Record<string, string> = {
   english: 'en',
@@ -206,9 +206,14 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
   }
 }
 
-async function probeStream(stream: NormalizedStream) {
+async function probeStream(stream: NormalizedStream, provider: string): Promise<{ usable: boolean; reason?: string }> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), STREAM_PROBE_TIMEOUT_MS)
+  const url = stream.streamUrl.split('?')[0]
+  const finish = (result: { usable: boolean; reason?: string }) => {
+    console.log('[watch] stream probe', { url, provider, ...result })
+    return result
+  }
   try {
     const headers = withProbeHeaders(stream.headers)
     const response = await fetch(stream.streamUrl, {
@@ -217,12 +222,16 @@ async function probeStream(stream: NormalizedStream) {
       signal: controller.signal,
       cache: 'no-store',
     })
-    if (!response.ok) return false
-    if (stream.type !== 'hls' && !stream.streamUrl.toLowerCase().includes('.m3u8')) return true
+    if (!response.ok) return finish({ usable: false, reason: `http_${response.status}` })
+    if (stream.type !== 'hls' && !stream.streamUrl.toLowerCase().includes('.m3u8')) return finish({ usable: true })
     const sample = await response.text()
     return sample.includes('#EXTM3U')
-  } catch {
-    return false
+      ? finish({ usable: true })
+      : finish({ usable: false, reason: 'no_extm3u_marker' })
+  } catch (error) {
+    return finish(error instanceof DOMException && error.name === 'AbortError'
+      ? { usable: false, reason: 'timeout' }
+      : { usable: false })
   } finally {
     clearTimeout(timeout)
   }
@@ -251,9 +260,9 @@ async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, ex
 
   const checked = await Promise.all(candidates.map(async (candidate) => ({
     ...candidate,
-    usable: await probeStream(candidate.stream),
+    probe: await probeStream(candidate.stream, candidate.provider),
   })))
-  return checked.find((candidate) => candidate.usable) ?? null
+  return checked.find((candidate) => candidate.probe.usable === true) ?? null
 }
 
 export async function OPTIONS() {

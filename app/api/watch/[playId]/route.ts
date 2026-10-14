@@ -33,6 +33,10 @@ const KNOWN_PROVIDERS = new Set([
   'mkissa', 'reanime', 'anikoto', 'animegg', 'animenosub', 'anizone',
   'aniwaves', 'senshi', 'kaa', 'animedunya', 'animeonsen', 'anipm', 'anibd',
 ])
+// Fallback providers: a working stream URL is enough, no subtitle required.
+const STREAM_ONLY_PROVIDERS = new Set(['aniwaves', 'senshi'])
+// Order they are tried in right after anipm.
+const PRIORITY_FALLBACK_PROVIDERS = ['aniwaves', 'senshi']
 
 type ProviderEntry = {
   provider?: string
@@ -127,6 +131,12 @@ function providersFromCatalog(catalog: Record<string, unknown> | null, episodeNu
       if (match) (audio === 'sub' ? sub : dub).push({ provider, episodeId: match.id })
     }
   }
+  const rank = (entry: ProviderEntry) => {
+    const index = PRIORITY_FALLBACK_PROVIDERS.indexOf(entry.provider ?? '')
+    return index === -1 ? PRIORITY_FALLBACK_PROVIDERS.length : index
+  }
+  sub.sort((a, b) => rank(a) - rank(b))
+  dub.sort((a, b) => rank(a) - rank(b))
   return { sub, dub }
 }
 
@@ -149,7 +159,8 @@ function qualify(body: WatchResponse | null, requireSubtitle: boolean, providerN
   if (!body || 'error' in body || !Array.isArray(body.streams) || body.streams.length === 0) return null
   const candidates = body.streams.filter((entry) =>
     typeof entry?.url === 'string' && entry.url.length > 0 &&
-    (!requireSubtitle || (Array.isArray(entry.subtitles) && entry.subtitles.some((subtitle) => typeof subtitle?.url === 'string' && subtitle.url.length > 0))) &&
+    (!STREAM_ONLY_PROVIDERS.has(providerName) || entry.type !== 'embed') &&
+    (!requireSubtitle || STREAM_ONLY_PROVIDERS.has(providerName) || (Array.isArray(entry.subtitles) && entry.subtitles.some((subtitle) => typeof subtitle?.url === 'string' && subtitle.url.length > 0))) &&
     !excluded.has(`${providerName}:${entry.server ?? 'default'}`),
   )
   if (candidates.length === 0) return null
@@ -198,7 +209,15 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
     audio,
     provider,
     ...stream,
-    streamUrl: proxied ? await signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest') : stream.streamUrl,
+    streamUrl: proxied
+      ? await signProxyUrl(
+          stream.streamUrl,
+          headers,
+          stream.type === 'hls' || stream.streamUrl.toLowerCase().includes('.m3u8')
+            ? '/api/proxy/manifest'
+            : '/api/proxy/segment',
+        )
+      : stream.streamUrl,
     headers: proxied ? {} : stream.headers,
     subtitles,
     intro,
@@ -299,7 +318,11 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     provider: 'anipm',
     episodeId: `watch/anipm/${episode.anilist_id}/sub/anipm-${episode.episode_number}`,
   }
-  subProviders = mergeProviders(subProviders, [anipmFallback])
+  const streamOnlyFallbacks: ProviderEntry[] = PRIORITY_FALLBACK_PROVIDERS.map((provider) => ({
+    provider,
+    episodeId: `watch/${provider}/${episode.anilist_id}/sub/${provider}-${episode.episode_number}`,
+  }))
+  subProviders = mergeProviders(subProviders, [anipmFallback, ...streamOnlyFallbacks])
 
   if (subProviders.length === 0 && dubProviders.length === 0) return json({ error: 'NO_PROVIDERS_AVAILABLE' }, 404)
 

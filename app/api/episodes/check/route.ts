@@ -1,3 +1,4 @@
+import { after } from 'next/server'
 import {
   deduplicateEntries,
   findExistingPendingSyncEntries,
@@ -8,14 +9,13 @@ import {
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 240
+export const maxDuration = 60
 
 const OTAKUNAIJA_BASE = process.env.OTAKUNAIJA_BASE_URL ?? 'https://otakunaija.name.ng'
 const ANIVEXA_BASE = process.env.ANIVEXA_BASE_URL ?? 'https://anivexa.otakunaija.name.ng'
-const DEFAULT_BATCH = 8
+const DEFAULT_BATCH = 12
 const MAX_BATCH = 25
-const CONCURRENCY = 3
-const DEADLINE_MS = 120_000 // stop starting new anime after this (cron-job.org cuts responses at 30s)
+const CONCURRENCY = Number(process.env.EPISODE_CHECK_CONCURRENCY) || 4
 const MAX_FILL_WHEN_HAS_EPISODES = 100
 // Optional: comma-separated provider slugs, e.g. "mkissa,anikoto,animegg,aniwaves,senshi,anipm".
 // When set, only those providers are queried (much faster than asking all 12).
@@ -23,7 +23,7 @@ const ANIVEXA_PROVIDERS = (process.env.ANIVEXA_PROVIDERS ?? '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean)
-const ANIVEXA_TIMEOUT_MS = Number(process.env.ANIVEXA_TIMEOUT_MS) || 15_000
+const ANIVEXA_TIMEOUT_MS = Number(process.env.ANIVEXA_TIMEOUT_MS) || 25_000
 
 type FeedItem = {
   series_id: number
@@ -193,81 +193,112 @@ async function checkOne(item: FeedItem, quorumOverride: number | null) {
 
 // ---------- Route ----------
 
+const SYNC_BUDGET_MS = 26_000 // ?wait=1 manual runs
+const ASYNC_BUDGET_MS = 55_000 // background runs (maxDuration is 60s)
+
+async function runCheck(batch: number, quorumOverride: number | null, budgetMs: number) {
+  const started = Date.now()
+  const [feed, state] = await Promise.all([fetchFeed(), loadState()])
+
+  // Never-checked first (no state row), then oldest last_checked_at.
+  // This guarantees every anime is checked once before any is checked twice.
+  const queue = [...feed].sort((a, b) => {
+    const ta = state.get(a.anilist_id) ?? 0
+    const tb = state.get(b.anilist_id) ?? 0
+    return ta - tb || a.anilist_id - b.anilist_id
+  })
+  const picked = queue.slice(0, batch)
+  const neverChecked = feed.filter((f) => !state.has(f.anilist_id)).length
+
+  const results: any[] = []
+  let totalInserted = 0
+  let stoppedByBudget = false
+  let next = 0
+
+  const worker = async () => {
+    while (true) {
+      // Only start an anime if it can still finish inside the budget at worst-case request time.
+      if (Date.now() - started + ANIVEXA_TIMEOUT_MS > budgetMs) {
+        stoppedByBudget = true
+        return
+      }
+      const item = picked[next++]
+      if (!item) return
+      try {
+        const r = await checkOne(item, quorumOverride)
+        totalInserted += r.inserted
+        await stamp(item.anilist_id, r.missing.length, null)
+        results.push({
+          anilistId: item.anilist_id,
+          title: item.title,
+          haveLatest: item.latest_episode,
+          haveCount: item.episode_count,
+          missingCount: r.missing.length,
+          missingSample: r.missing.slice(0, 20),
+          providersWithData: r.providersWithData,
+          minAgree: r.minAgree,
+          inserted: r.inserted,
+          alreadyKnown: r.alreadyKnown,
+        })
+      } catch (e) {
+        const message = getErrorMessage(e)
+        // Stamp anyway so one broken anime can't block the rotation; it is retried next loop.
+        await stamp(item.anilist_id, 0, message).catch(() => {})
+        results.push({ anilistId: item.anilist_id, title: item.title, error: message })
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker))
+
+  return {
+    feedSize: feed.length,
+    neverChecked,
+    batchRequested: batch,
+    checked: results.length,
+    pendingSyncInserted: totalInserted,
+    stoppedByBudget,
+    tookMs: Date.now() - started,
+    results,
+  }
+}
+
 export async function GET(request: Request) {
   const secret = process.env.EPISODE_CHECK_SECRET
   if (secret && request.headers.get('authorization') !== `Bearer ${secret}`) {
     return Response.json({ error: 'UNAUTHORIZED' }, { status: 401 })
   }
 
-  const started = Date.now()
   const params = new URL(request.url).searchParams
   const batch = Math.min(Math.max(Number(params.get('batch')) || DEFAULT_BATCH, 1), MAX_BATCH)
   const quorumParam = Number(params.get('quorum'))
   const quorumOverride = quorumParam >= 1 ? quorumParam : null
 
-  try {
-    const [feed, state] = await Promise.all([fetchFeed(), loadState()])
-
-    // Never-checked first (no state row), then oldest last_checked_at.
-    // This guarantees every anime is checked once before any is checked twice.
-    const queue = [...feed].sort((a, b) => {
-      const ta = state.get(a.anilist_id) ?? 0
-      const tb = state.get(b.anilist_id) ?? 0
-      return ta - tb || a.anilist_id - b.anilist_id
-    })
-    const picked = queue.slice(0, batch)
-    const neverChecked = feed.filter((f) => !state.has(f.anilist_id)).length
-
-    const results: any[] = []
-    let totalInserted = 0
-    let stoppedByBudget = false
-    let next = 0
-
-    const worker = async () => {
-      while (true) {
-        if (Date.now() - started > DEADLINE_MS) {
-          stoppedByBudget = true
-          return
-        }
-        const item = picked[next++]
-        if (!item) return
-        try {
-          const r = await checkOne(item, quorumOverride)
-          totalInserted += r.inserted
-          await stamp(item.anilist_id, r.missing.length, null)
-          results.push({
-            anilistId: item.anilist_id,
-            title: item.title,
-            haveLatest: item.latest_episode,
-            haveCount: item.episode_count,
-            missingCount: r.missing.length,
-            missingSample: r.missing.slice(0, 20),
-            providersWithData: r.providersWithData,
-            minAgree: r.minAgree,
-            inserted: r.inserted,
-            alreadyKnown: r.alreadyKnown,
-          })
-        } catch (e) {
-          const message = getErrorMessage(e)
-          // Stamp anyway so one broken anime can't block the rotation; it is retried next loop.
-          await stamp(item.anilist_id, 0, message).catch(() => {})
-          results.push({ anilistId: item.anilist_id, title: item.title, error: message })
-        }
-      }
+  // Manual testing: ?wait=1 runs inline and returns the full results.
+  if (params.get('wait') === '1') {
+    try {
+      return Response.json(await runCheck(batch, quorumOverride, SYNC_BUDGET_MS))
+    } catch (error) {
+      return jsonError(getErrorMessage(error))
     }
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker))
-
-    return Response.json({
-      feedSize: feed.length,
-      neverChecked,
-      batchRequested: batch,
-      checked: results.length,
-      pendingSyncInserted: totalInserted,
-      stoppedByBudget,
-      tookMs: Date.now() - started,
-      results,
-    })
-  } catch (error) {
-    return jsonError(getErrorMessage(error))
   }
+
+  // Cron: answer immediately (cron-job.org cuts off at 30s) and keep working in the background.
+  after(async () => {
+    try {
+      const r = await runCheck(batch, quorumOverride, ASYNC_BUDGET_MS)
+      console.log(
+        'episode-check',
+        JSON.stringify({
+          checked: r.checked,
+          inserted: r.pendingSyncInserted,
+          stoppedByBudget: r.stoppedByBudget,
+          tookMs: r.tookMs,
+          errors: r.results.filter((x: any) => x.error).length,
+        }),
+      )
+    } catch (error) {
+      console.error('episode-check failed', getErrorMessage(error))
+    }
+  })
+  return Response.json({ accepted: true, batch }, { status: 202 })
 }

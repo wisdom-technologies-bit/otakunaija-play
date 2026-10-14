@@ -51,18 +51,6 @@ export async function proxyUrl(targetUrl: string, headers: Record<string, string
 export function withDefaultUserAgent(headers: Record<string, string>) {
   const next = { ...headers }
   if (!Object.keys(next).some((key) => key.toLowerCase() === 'user-agent')) next['User-Agent'] = 'Mozilla/5.0'
-  if (!Object.keys(next).some((key) => key.toLowerCase() === 'accept')) next.Accept = '*/*'
-  if (!Object.keys(next).some((key) => key.toLowerCase() === 'origin')) {
-    const refererKey = Object.keys(next).find((key) => key.toLowerCase() === 'referer')
-    const referer = refererKey ? next[refererKey] : undefined
-    if (typeof referer === 'string') {
-      try {
-        next.Origin = new URL(referer).origin
-      } catch {
-        // Ignore malformed optional referers.
-      }
-    }
-  }
   return next
 }
 

@@ -6,8 +6,8 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 240
 
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
-const REQUEST_TIMEOUT_MS = 6_000
-const EPISODE_LOOKUP_TIMEOUT_MS = 5_000
+const REQUEST_TIMEOUT_MS = 12_000
+const EPISODE_LOOKUP_TIMEOUT_MS = 8_000
 const STREAM_PROBE_TIMEOUT_MS = 4_000
 
 const SUBTITLE_LABEL_TO_SRCLANG: Record<string, string> = {
@@ -182,6 +182,7 @@ function ageMs(value: string) {
 
 async function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, stream: NormalizedStream, intro: TimeRange | null = null, outro: TimeRange | null = null) {
   const headers = stream.headers as Record<string, string>
+  const proxied = Object.keys(headers).length > 0
   const subtitles = await Promise.all(stream.subtitles.map(async (subtitle) => {
     const label = typeof subtitle.label === 'string' ? subtitle.label.trim().toLowerCase() : null
     const correctedSrclang = label ? SUBTITLE_LABEL_TO_SRCLANG[label] : undefined
@@ -197,61 +198,34 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
     audio,
     provider,
     ...stream,
-    // Always proxy provider streams so the client never receives an unverified
-    // or direct upstream URL. This also gives every provider the same HLS
-    // manifest, segment, and subtitle header handling.
-    streamUrl: await signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest'),
-    headers: {},
+    streamUrl: proxied ? await signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest') : stream.streamUrl,
+    headers: proxied ? {} : stream.headers,
     subtitles,
     intro,
     outro,
   }
 }
 
-async function probeStream(
-  stream: NormalizedStream,
-  provider: string,
-  _proxyOrigin: string,
-): Promise<{ usable: boolean; reason?: string }> {
-  // Single upstream check only. No second fetch through our own proxy: it
-  // doubled latency and broke on tokenized manifest URLs.
-  let host = 'unknown'
-  try {
-    host = new URL(stream.streamUrl).hostname
-  } catch {
-    return { usable: false, reason: 'invalid_url' }
-  }
-
+async function probeStream(stream: NormalizedStream) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), STREAM_PROBE_TIMEOUT_MS)
-  let result: { usable: boolean; reason?: string }
-
   try {
-    const res = await fetch(stream.streamUrl, {
+    const headers = withProbeHeaders(stream.headers)
+    const response = await fetch(stream.streamUrl, {
       method: 'GET',
-      headers: withProbeHeaders(stream.headers),
+      headers,
       signal: controller.signal,
       cache: 'no-store',
     })
-    if (!res.ok) {
-      result = { usable: false, reason: `http_${res.status}` }
-    } else if (stream.type === 'hls' || stream.streamUrl.toLowerCase().includes('.m3u8')) {
-      const text = await res.text()
-      result = text.includes('#EXTM3U') ? { usable: true } : { usable: false, reason: 'no_extm3u_marker' }
-    } else {
-      await res.body?.cancel()
-      result = { usable: true }
-    }
-  } catch (error) {
-    result = error instanceof DOMException && error.name === 'AbortError'
-      ? { usable: false, reason: 'timeout' }
-      : { usable: false, reason: 'request_failed' }
+    if (!response.ok) return false
+    if (stream.type !== 'hls' && !stream.streamUrl.toLowerCase().includes('.m3u8')) return true
+    const sample = await response.text()
+    return sample.includes('#EXTM3U')
+  } catch {
+    return false
   } finally {
     clearTimeout(timeout)
   }
-
-  console.log('[watch] stream probe', { provider, host, ...result })
-  return result
 }
 
 function withProbeHeaders(headers: Record<string, unknown>) {
@@ -265,39 +239,21 @@ function withProbeHeaders(headers: Record<string, unknown>) {
   return result
 }
 
-type Winner = { provider: string; stream: NormalizedStream; intro: TimeRange | null; outro: TimeRange | null }
-
-async function tryEntry(entry: ProviderEntry, requireSubtitle: boolean, excluded: Set<string>, proxyOrigin: string): Promise<Winner | null> {
-  const provider = entry.provider ?? ''
-  const body = await fetchWatch(entry.episodeId ?? '')
-  const stream = qualify(body, requireSubtitle, provider, excluded)
-  if (!stream) return null
-  const probe = await probeStream(stream, provider, proxyOrigin)
-  return probe.usable ? { provider, stream, intro: body?.intro ?? null, outro: body?.outro ?? null } : null
-}
-
-function firstWinner(tasks: Promise<Winner | null>[]): Promise<Winner | null> {
-  return new Promise((resolve) => {
-    if (tasks.length === 0) return resolve(null)
-    let pending = tasks.length
-    for (const task of tasks) {
-      task
-        .then((result) => { if (result) resolve(result) })
-        .catch(() => {})
-        .finally(() => {
-          pending -= 1
-          if (pending === 0) resolve(null)
-        })
-    }
+async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>) {
+  const responses = await Promise.allSettled(entries.map((entry) => fetchWatch(entry.episodeId ?? '')))
+  const candidates = responses.flatMap((settled, index) => {
+    if (settled.status !== 'fulfilled') return []
+    const provider = entries[index].provider ?? ''
+    const stream = qualify(settled.value, requireSubtitle, provider, excluded)
+    return stream ? [{ provider, stream, intro: settled.value?.intro ?? null, outro: settled.value?.outro ?? null }] : []
   })
-}
+  if (candidates.length === 0) return null
 
-async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>, proxyOrigin: string) {
-  const isAnipm = (entry: ProviderEntry) => entry.provider?.toLowerCase() === 'anipm'
-  // Ani.pm still runs in parallel but only counts if no other provider wins.
-  const anipmTask = firstWinner(entries.filter(isAnipm).map((entry) => tryEntry(entry, requireSubtitle, excluded, proxyOrigin)))
-  const preferred = await firstWinner(entries.filter((entry) => !isAnipm(entry)).map((entry) => tryEntry(entry, requireSubtitle, excluded, proxyOrigin)))
-  return preferred ?? (await anipmTask)
+  const checked = await Promise.all(candidates.map(async (candidate) => ({
+    ...candidate,
+    usable: await probeStream(candidate.stream),
+  })))
+  return checked.find((candidate) => candidate.usable) ?? null
 }
 
 export async function OPTIONS() {
@@ -354,23 +310,17 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
       const cachedResponse = await fetchWatch(cached.episodeId)
       const stream = qualify(cachedResponse, episode.resolved_audio === 'sub', episode.resolved_provider, excluded)
       if (stream) {
-        const probe = await probeStream(stream, episode.resolved_provider, new URL(_request.url).origin)
-        if (probe.usable) {
-          if (episode.needs_resync) {
-            const { error: resyncClearError } = await supabase
-              .from('episodes')
-              .update({ needs_resync: false, resync_requested_at: null })
-              .eq('play_id', playId)
-            if (resyncClearError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
-          }
-          return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream, cachedResponse?.intro ?? null, cachedResponse?.outro ?? null))
+        if (episode.needs_resync) {
+          const { error: resyncClearError } = await supabase.from('episodes').update({ needs_resync: false, resync_requested_at: null }).eq('play_id', playId)
+          if (resyncClearError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
         }
+        return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream, cachedResponse?.intro ?? null, cachedResponse?.outro ?? null))
       }
     }
   }
 
-  let subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded, new URL(_request.url).origin) : null
-  let dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded, new URL(_request.url).origin) : null
+  let subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded) : null
+  let dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded) : null
 
   // Provider availability can change without the episode row being resynced. If
   // the stored providers fail, refresh the catalog and retry newly discovered
@@ -379,8 +329,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     const discovered = providersFromCatalog(await fetchEpisodeCatalog(episode.anilist_id), episode.episode_number)
     subProviders = mergeProviders(subProviders, discovered.sub)
     dubProviders = mergeProviders(dubProviders, discovered.dub)
-    subWinner = await findWinner(subProviders, true, excluded, new URL(_request.url).origin)
-    dubWinner = !subWinner ? await findWinner(dubProviders, false, excluded, new URL(_request.url).origin) : null
+    subWinner = await findWinner(subProviders, true, excluded)
+    dubWinner = !subWinner ? await findWinner(dubProviders, false, excluded) : null
   }
 
   const winner = subWinner

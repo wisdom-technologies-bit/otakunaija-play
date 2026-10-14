@@ -6,7 +6,7 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 240
 
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
-const REQUEST_TIMEOUT_MS = 6_000
+const REQUEST_TIMEOUT_MS = 12_000
 const FIRST_RESULT_GRACE_MS = 2_500
 const EPISODE_LOOKUP_TIMEOUT_MS = 8_000
 const STREAM_PROBE_TIMEOUT_MS = 4_000
@@ -238,8 +238,14 @@ async function probeStream(stream: NormalizedStream) {
       signal: controller.signal,
       cache: 'no-store',
     })
-    if (!response.ok) return false
-    if (stream.type !== 'hls' && !stream.streamUrl.toLowerCase().includes('.m3u8')) return true
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {})
+      return false
+    }
+    if (stream.type !== 'hls' && !stream.streamUrl.toLowerCase().includes('.m3u8')) {
+      await response.body?.cancel().catch(() => {})
+      return true
+    }
     const sample = await response.text()
     return sample.includes('#EXTM3U')
   } catch {
@@ -260,7 +266,7 @@ function withProbeHeaders(headers: Record<string, unknown>) {
   return result
 }
 
-async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>) {
+async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>, trace?: string[]) {
   type Winner = { provider: string; stream: NormalizedStream; intro: TimeRange | null; outro: TimeRange | null }
   if (entries.length === 0) return null
 
@@ -298,10 +304,17 @@ async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, ex
     entries.forEach((entry, index) => {
       ;(async (): Promise<Winner | null> => {
         const provider = entry.provider ?? ''
+        const started = Date.now()
         const body = await fetchWatch(entry.episodeId ?? '')
+        const fetchMs = Date.now() - started
         const stream = qualify(body, requireSubtitle, provider, excluded, entry.fallback === true)
-        if (!stream) return null
-        if (!(await probeStream(stream))) return null
+        if (!stream) {
+          trace?.push(`${provider}: ${fetchMs}ms, ${body ? 'no qualifying stream (subtitle/embed/excluded filter)' : 'fetch failed or timed out'}`)
+          return null
+        }
+        const usable = await probeStream(stream)
+        trace?.push(`${provider}: fetch ${fetchMs}ms, ${stream.server ?? 'default'} (${stream.type}), probe ${usable ? 'ok' : 'FAILED'} at ${Date.now() - started}ms`)
+        if (!usable) return null
         return { provider, stream, intro: body?.intro ?? null, outro: body?.outro ?? null }
       })()
         .catch(() => null)
@@ -381,13 +394,14 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     }
   }
 
-  let subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded) : null
-  let dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded) : null
+  const debug = new URL(_request.url).searchParams.get('debug') === '1'
+  const trace: string[] = []
 
-  // Provider availability can change without the episode row being resynced. If
-  // the stored providers fail, refresh the catalog and retry newly discovered
-  // providers (including Ani.pm) before declaring the episode unavailable.
+  let subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded, trace) : null
+  let dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded, trace) : null
+
   if (!subWinner && !dubWinner) {
+    trace.push('--- catalog retry ---')
     const discovered = providersFromCatalog(await fetchEpisodeCatalog(episode.anilist_id), episode.episode_number)
     const triedSubCount = subProviders.length
     const triedDubCount = dubProviders.length
@@ -395,8 +409,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     dubProviders = mergeProviders(dubProviders, discovered.dub)
     const newSub = subProviders.slice(triedSubCount)
     const newDub = dubProviders.slice(triedDubCount)
-    subWinner = newSub.length > 0 ? await findWinner(newSub, true, excluded) : null
-    dubWinner = !subWinner && newDub.length > 0 ? await findWinner(newDub, false, excluded) : null
+    subWinner = newSub.length > 0 ? await findWinner(newSub, true, excluded, trace) : null
+    dubWinner = !subWinner && newDub.length > 0 ? await findWinner(newDub, false, excluded, trace) : null
   }
 
   const winner = subWinner
@@ -406,7 +420,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
       : null
   if (!winner) {
     await supabase.from('episodes').update({ needs_resync: true, resync_requested_at: new Date().toISOString() }).eq('play_id', playId)
-    return json({ error: 'NO_WORKING_STREAM' }, 404)
+    return json(debug ? { error: 'NO_WORKING_STREAM', trace } : { error: 'NO_WORKING_STREAM' }, 404)
   }
 
   const { error: updateError } = await supabase
@@ -420,5 +434,6 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     .eq('play_id', playId)
   if (updateError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
 
-  return json(await responseFor(playId, winner.audio, winner.provider, winner.stream, winner.intro, winner.outro))
+  const payload = await responseFor(playId, winner.audio, winner.provider, winner.stream, winner.intro, winner.outro)
+  return json(debug ? { ...payload, trace } : payload)
 }

@@ -29,6 +29,8 @@ export async function GET(request: Request) {
     const response = await fetch(verified.targetUrl, {
       headers: withDefaultUserAgent(verified.headers),
       signal: controller.signal,
+      redirect: 'follow',
+      cache: 'no-store',
     })
     if (!response.ok) return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
 

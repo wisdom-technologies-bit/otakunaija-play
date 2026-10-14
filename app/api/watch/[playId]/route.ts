@@ -301,20 +301,38 @@ function withProbeHeaders(headers: Record<string, unknown>) {
 }
 
 async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>) {
-  const responses = await Promise.allSettled(entries.map((entry) => fetchWatch(entry.episodeId ?? '')))
+  const orderedEntries = entries.filter((entry) => entry.provider?.toLowerCase() !== 'anipm')
+  const anipmEntries = entries.filter((entry) => entry.provider?.toLowerCase() === 'anipm')
+  const responses = await Promise.allSettled(orderedEntries.map((entry) => fetchWatch(entry.episodeId ?? '')))
   const candidates = responses.flatMap((settled, index) => {
     if (settled.status !== 'fulfilled') return []
-    const provider = entries[index].provider ?? ''
+    const provider = orderedEntries[index].provider ?? ''
     const stream = qualify(settled.value, requireSubtitle, provider, excluded)
     return stream ? [{ provider, stream, intro: settled.value?.intro ?? null, outro: settled.value?.outro ?? null }] : []
   })
-  if (candidates.length === 0) return null
 
   const checked = await Promise.all(candidates.map(async (candidate) => ({
     ...candidate,
     probe: await probeStream(candidate.stream, candidate.provider),
   })))
-  return checked.find((candidate) => candidate.probe.usable === true) ?? null
+  const winner = checked.find((candidate) => candidate.probe.usable === true)
+  if (winner) return winner
+
+  // Ani.pm is intentionally a last-resort provider. It should not win while
+  // another provider has a usable stream, but it remains available when all
+  // preferred providers fail or omit the requested subtitle tracks.
+  const fallbackResponses = await Promise.allSettled(anipmEntries.map((entry) => fetchWatch(entry.episodeId ?? '')))
+  const fallbackCandidates = fallbackResponses.flatMap((settled, index) => {
+    if (settled.status !== 'fulfilled') return []
+    const provider = anipmEntries[index].provider ?? 'anipm'
+    const stream = qualify(settled.value, requireSubtitle, provider, excluded)
+    return stream ? [{ provider, stream, intro: settled.value?.intro ?? null, outro: settled.value?.outro ?? null }] : []
+  })
+  const fallbackChecked = await Promise.all(fallbackCandidates.map(async (candidate) => ({
+    ...candidate,
+    probe: await probeStream(candidate.stream, candidate.provider),
+  })))
+  return fallbackChecked.find((candidate) => candidate.probe.usable === true) ?? null
 }
 
 export async function OPTIONS() {

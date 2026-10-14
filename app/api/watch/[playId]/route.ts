@@ -41,6 +41,7 @@ const PRIORITY_FALLBACK_PROVIDERS = ['aniwaves', 'senshi']
 type ProviderEntry = {
   provider?: string
   episodeId?: string
+  fallback?: boolean
 }
 
 type StreamEntry = {
@@ -155,12 +156,12 @@ async function fetchWatch(episodeId: string): Promise<WatchResponse | null> {
   }
 }
 
-function qualify(body: WatchResponse | null, requireSubtitle: boolean, providerName: string, excluded: Set<string>): NormalizedStream | null {
+function qualify(body: WatchResponse | null, requireSubtitle: boolean, providerName: string, excluded: Set<string>, streamOnly = false): NormalizedStream | null {
   if (!body || 'error' in body || !Array.isArray(body.streams) || body.streams.length === 0) return null
   const candidates = body.streams.filter((entry) =>
     typeof entry?.url === 'string' && entry.url.length > 0 &&
     (!STREAM_ONLY_PROVIDERS.has(providerName) || entry.type !== 'embed') &&
-    (!requireSubtitle || STREAM_ONLY_PROVIDERS.has(providerName) || (Array.isArray(entry.subtitles) && entry.subtitles.some((subtitle) => typeof subtitle?.url === 'string' && subtitle.url.length > 0))) &&
+    (!requireSubtitle || streamOnly || (Array.isArray(entry.subtitles) && entry.subtitles.some((subtitle) => typeof subtitle?.url === 'string' && subtitle.url.length > 0))) &&
     !excluded.has(`${providerName}:${entry.server ?? 'default'}`),
   )
   if (candidates.length === 0) return null
@@ -263,7 +264,7 @@ async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, ex
   const candidates = responses.flatMap((settled, index) => {
     if (settled.status !== 'fulfilled') return []
     const provider = entries[index].provider ?? ''
-    const stream = qualify(settled.value, requireSubtitle, provider, excluded)
+    const stream = qualify(settled.value, requireSubtitle, provider, excluded, entries[index].fallback === true)
     return stream ? [{ provider, stream, intro: settled.value?.intro ?? null, outro: settled.value?.outro ?? null }] : []
   })
   if (candidates.length === 0) return null
@@ -321,6 +322,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   const streamOnlyFallbacks: ProviderEntry[] = PRIORITY_FALLBACK_PROVIDERS.map((provider) => ({
     provider,
     episodeId: `watch/${provider}/${episode.anilist_id}/sub/${provider}-${episode.episode_number}`,
+    fallback: true,
   }))
   subProviders = mergeProviders(subProviders, [anipmFallback, ...streamOnlyFallbacks])
 
@@ -331,7 +333,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     const cached = entries.find((entry) => entry.provider === episode.resolved_provider)
     if (cached?.episodeId) {
       const cachedResponse = await fetchWatch(cached.episodeId)
-      const stream = qualify(cachedResponse, episode.resolved_audio === 'sub', episode.resolved_provider, excluded)
+      const stream = qualify(cachedResponse, episode.resolved_audio === 'sub', episode.resolved_provider, excluded, cached.fallback === true)
       if (stream) {
         if (episode.needs_resync) {
           const { error: resyncClearError } = await supabase.from('episodes').update({ needs_resync: false, resync_requested_at: null }).eq('play_id', playId)

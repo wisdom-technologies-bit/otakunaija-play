@@ -29,11 +29,15 @@ const ANIVEXA_PROVIDERS = (process.env.ANIVEXA_PROVIDERS ?? '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean)
-const ANIVEXA_TIMEOUT_MS = Number(process.env.ANIVEXA_TIMEOUT_MS) || 25_000
 
-// Wall-clock budgets. Vercel maxDuration is 60s.
-const SYNC_BUDGET_MS = 26_000 // ?wait=1 manual runs (Termux)
-const ASYNC_BUDGET_MS = 55_000 // background runs via after()
+// Per-request timeout for Anivexa. Must stay well under the run budgets below,
+// because the worker start-gate uses this value to decide whether it can still
+// fit one more anime inside the wall-clock budget.
+const ANIVEXA_TIMEOUT_MS = Number(process.env.ANIVEXA_TIMEOUT_MS) || 45_000
+
+// Wall-clock budgets. Vercel maxDuration is 240s.
+const SYNC_BUDGET_MS = 200_000 // ?wait=1 manual runs (Termux)
+const ASYNC_BUDGET_MS = 220_000 // background runs via after()
 
 type FeedItem = {
   series_id: number
@@ -271,8 +275,8 @@ async function runCheck(batch: number, quorumOverride: number | null, budgetMs: 
 //
 // Two run modes:
 //   1) Default (cron):    responds 202 immediately, then keeps working in the background
-//                         via Next's after(). The Vercel function stays alive up to 55s.
-//                         cron-job.org's 30s cutoff won't kill it.
+//                         via Next's after(). The Vercel function stays alive up to
+//                         ASYNC_BUDGET_MS. cron-job.org's 30s cutoff won't kill it.
 //   2) ?wait=1 (manual):  runs synchronously inside the request and returns the full
 //                         results as JSON. Use this from Termux for testing.
 
@@ -300,6 +304,9 @@ export async function GET(request: Request) {
   after(async () => {
     try {
       const r = await runCheck(batch, quorumOverride, ASYNC_BUDGET_MS)
+      const errors = r.results
+        .filter((x: any) => x.error)
+        .map((x: any) => ({ id: x.anilistId, title: x.title, error: x.error }))
       console.log(
         'episode-check',
         JSON.stringify({
@@ -307,7 +314,8 @@ export async function GET(request: Request) {
           inserted: r.pendingSyncInserted,
           stoppedByBudget: r.stoppedByBudget,
           tookMs: r.tookMs,
-          errors: r.results.filter((x: any) => x.error).length,
+          errorCount: errors.length,
+          errors,
         }),
       )
     } catch (error) {

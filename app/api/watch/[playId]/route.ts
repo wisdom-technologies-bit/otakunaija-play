@@ -206,32 +206,84 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
   }
 }
 
-async function probeStream(stream: NormalizedStream, provider: string): Promise<{ usable: boolean; reason?: string }> {
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), STREAM_PROBE_TIMEOUT_MS)
-  const url = stream.streamUrl.split('?')[0]
+async function probeStream(
+  stream: NormalizedStream,
+  provider: string,
+): Promise<{ usable: boolean; reason?: string }> {
   const finish = (result: { usable: boolean; reason?: string }) => {
-    console.log('[watch] stream probe', { url, provider, ...result })
+    // Never log signed stream URLs: their tokens may be in the URL path.
+    let host = 'unknown'
+    try {
+      host = new URL(stream.streamUrl).hostname
+    } catch {
+      // Keep the host as unknown if the URL is malformed.
+    }
+
+    console.log('[watch] stream probe', {
+      provider,
+      host,
+      ...result,
+    })
+
     return result
   }
+
+  let streamHost = ''
   try {
-    const headers = withProbeHeaders(stream.headers)
+    streamHost = new URL(stream.streamUrl).hostname.toLowerCase()
+  } catch {
+    return finish({ usable: false, reason: 'invalid_url' })
+  }
+
+  // Settlar may reject server-side availability probes even when
+  // the provider returns a candidate intended for playback.
+  // Skip probing only for Ani.pm's known Settlar stream host.
+  if (provider.toLowerCase() === 'anipm' && streamHost === 'media.settlar.io') {
+    return finish({
+      usable: true,
+      reason: 'provider_probe_skipped',
+    })
+  }
+
+  const controller = new AbortController()
+  const timeout = setTimeout(
+    () => controller.abort(),
+    STREAM_PROBE_TIMEOUT_MS,
+  )
+
+  try {
     const response = await fetch(stream.streamUrl, {
       method: 'GET',
-      headers,
+      headers: withProbeHeaders(stream.headers),
       signal: controller.signal,
       cache: 'no-store',
     })
-    if (!response.ok) return finish({ usable: false, reason: `http_${response.status}` })
-    if (stream.type !== 'hls' && !stream.streamUrl.toLowerCase().includes('.m3u8')) return finish({ usable: true })
+
+    if (!response.ok) {
+      return finish({
+        usable: false,
+        reason: `http_${response.status}`,
+      })
+    }
+
+    if (
+      stream.type !== 'hls' &&
+      !stream.streamUrl.toLowerCase().includes('.m3u8')
+    ) {
+      return finish({ usable: true })
+    }
+
     const sample = await response.text()
+
     return sample.includes('#EXTM3U')
       ? finish({ usable: true })
       : finish({ usable: false, reason: 'no_extm3u_marker' })
   } catch (error) {
-    return finish(error instanceof DOMException && error.name === 'AbortError'
-      ? { usable: false, reason: 'timeout' }
-      : { usable: false })
+    return finish(
+      error instanceof DOMException && error.name === 'AbortError'
+        ? { usable: false, reason: 'timeout' }
+        : { usable: false, reason: 'request_failed' },
+    )
   } finally {
     clearTimeout(timeout)
   }

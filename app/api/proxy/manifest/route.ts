@@ -42,7 +42,7 @@ async function rewriteManifest(body: string, targetUrl: string, headers: Record<
     }
 
     const absolute = resolve(trimmed)
-    const route = absolute.toLowerCase().endsWith('.m3u8') ? '/api/proxy/manifest' : '/api/proxy/segment'
+    const route = absolute.toLowerCase().includes('.m3u8') ? '/api/proxy/manifest' : '/api/proxy/segment'
     rewritten.push(await signProxyUrl(absolute, headers, route))
   }
 

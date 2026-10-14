@@ -162,7 +162,7 @@ function qualify(body: WatchResponse | null, requireSubtitle: boolean, providerN
   const candidates = body.streams.filter((entry) =>
     typeof entry?.url === 'string' && entry.url.length > 0 &&
     (!STREAM_ONLY_PROVIDERS.has(providerName) || entry.type !== 'embed') &&
-    (!requireSubtitle || streamOnly || (Array.isArray(entry.subtitles) && entry.subtitles.some((subtitle) => typeof subtitle?.url === 'string' && subtitle.url.length > 0))) &&
+    (!requireSubtitle || streamOnly || STREAM_ONLY_PROVIDERS.has(providerName) || (Array.isArray(entry.subtitles) && entry.subtitles.some((subtitle) => typeof subtitle?.url === 'string' && subtitle.url.length > 0))) &&
     !excluded.has(`${providerName}:${entry.server ?? 'default'}`),
   )
   if (candidates.length === 0) return null
@@ -206,19 +206,14 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
       url: await signProxyUrl(subtitle.url, headers, '/api/proxy/subtitle'),
     }
   }))
+  const isDirectMedia = stream.type === 'mp4' || /\.(mp4|webm|mkv)(\?|$)/i.test(stream.streamUrl)
   return {
     playId,
     audio,
     provider,
     ...stream,
     streamUrl: proxied
-      ? await signProxyUrl(
-          stream.streamUrl,
-          headers,
-          stream.type === 'hls' || stream.streamUrl.toLowerCase().includes('.m3u8')
-            ? '/api/proxy/manifest'
-            : '/api/proxy/segment',
-        )
+      ? await signProxyUrl(stream.streamUrl, headers, isDirectMedia ? '/api/proxy/segment' : '/api/proxy/manifest')
       : stream.streamUrl,
     headers: proxied ? {} : stream.headers,
     subtitles,

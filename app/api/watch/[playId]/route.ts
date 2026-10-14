@@ -182,7 +182,6 @@ function ageMs(value: string) {
 
 async function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, stream: NormalizedStream, intro: TimeRange | null = null, outro: TimeRange | null = null) {
   const headers = stream.headers as Record<string, string>
-  const proxied = Object.keys(headers).length > 0
   const subtitles = await Promise.all(stream.subtitles.map(async (subtitle) => {
     const label = typeof subtitle.label === 'string' ? subtitle.label.trim().toLowerCase() : null
     const correctedSrclang = label ? SUBTITLE_LABEL_TO_SRCLANG[label] : undefined
@@ -198,8 +197,11 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
     audio,
     provider,
     ...stream,
-    streamUrl: proxied ? await signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest') : stream.streamUrl,
-    headers: proxied ? {} : stream.headers,
+    // Always proxy provider streams so the client never receives an unverified
+    // or direct upstream URL. This also gives every provider the same HLS
+    // manifest, segment, and subtitle header handling.
+    streamUrl: await signProxyUrl(stream.streamUrl, headers, '/api/proxy/manifest'),
+    headers: {},
     subtitles,
     intro,
     outro,
@@ -389,11 +391,17 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
       const cachedResponse = await fetchWatch(cached.episodeId)
       const stream = qualify(cachedResponse, episode.resolved_audio === 'sub', episode.resolved_provider, excluded)
       if (stream) {
-        if (episode.needs_resync) {
-          const { error: resyncClearError } = await supabase.from('episodes').update({ needs_resync: false, resync_requested_at: null }).eq('play_id', playId)
-          if (resyncClearError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
+        const probe = await probeStream(stream, episode.resolved_provider)
+        if (probe.usable) {
+          if (episode.needs_resync) {
+            const { error: resyncClearError } = await supabase
+              .from('episodes')
+              .update({ needs_resync: false, resync_requested_at: null })
+              .eq('play_id', playId)
+            if (resyncClearError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
+          }
+          return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream, cachedResponse?.intro ?? null, cachedResponse?.outro ?? null))
         }
-        return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream, cachedResponse?.intro ?? null, cachedResponse?.outro ?? null))
       }
     }
   }

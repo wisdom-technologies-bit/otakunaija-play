@@ -5,7 +5,16 @@ export const runtime = 'edge'
 const timeoutFetch = async (url: string, headers: Record<string, string>) => {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 15_000)
-  try { return await fetch(url, { headers: withDefaultUserAgent(headers), signal: controller.signal }) } finally { clearTimeout(timeout) }
+  try {
+    return await fetch(url, {
+      headers: withDefaultUserAgent(headers),
+      signal: controller.signal,
+      redirect: 'follow',
+      cache: 'no-store',
+    })
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 async function rewriteManifest(body: string, targetUrl: string, headers: Record<string, string>) {

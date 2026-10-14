@@ -9,7 +9,11 @@ export async function GET(request: Request) {
   const verified = await verifyProxySignature(params.get('u') ?? '', params.get('h') ?? '', params.get('e') ?? '', params.get('s') ?? '')
   if (!verified.valid || !verified.targetUrl || !verified.headers) return proxyJson({ error: 'INVALID_OR_EXPIRED_SIGNATURE' }, 403)
   try {
-    const response = await fetch(verified.targetUrl, { headers: withDefaultUserAgent(verified.headers) })
+    const response = await fetch(verified.targetUrl, {
+      headers: withDefaultUserAgent(verified.headers),
+      redirect: 'follow',
+      cache: 'no-store',
+    })
     if (!response.ok) return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
     const headers = new Headers(corsHeaders())
     headers.set('Cache-Control', 'public, max-age=3600')

@@ -68,6 +68,7 @@ type ShikimoriItem = {
   id: number | string
   episodes_aired?: number
   released_on?: string | null
+  aired_on?: string | null
 }
 
 async function shikimoriList(query: string, pages: number): Promise<ShikimoriItem[]> {
@@ -141,12 +142,13 @@ async function fetchShikimoriDiscovery() {
   const anons = await safe('anons', () => shikimoriList('status=anons&order=popularity', 2))
   await wait(400)
   const releasedAll = await safe('released', () =>
-    shikimoriList(`status=released&season=${year}&order=aired_on`, 2),
+    shikimoriList(`status=released&season=${year}&order=aired_on`, 3),
   )
-  const released = releasedAll.filter((i) => {
-    const t = i.released_on ? Date.parse(i.released_on) : NaN
+  const inWindow = (d?: string | null) => {
+    const t = d ? Date.parse(d) : NaN
     return t >= cutoff && t <= now
-  })
+  }
+  const released = releasedAll.filter((i) => inWindow(i.aired_on) || inWindow(i.released_on))
 
   const wanted: { mal: number; episode: number }[] = [
     ...ongoing.map((i) => ({ mal: toMal(i.id), episode: i.episodes_aired ?? 0 })),
@@ -290,6 +292,8 @@ export async function GET() {
       shikimoriSeen,
       shikimoriMapped: shikimoriEntries.length,
       shikimoriError,
+      shikimoriAlreadyKnown: shikimoriEntries.filter((e) => existingKeys.has(`${e.anilist_id}-${e.episode_number}`)).length,
+      entriesAlreadyKnown: entries.filter((e) => existingKeys.has(`${e.anilist_id}-${e.episode_number}`)).length,
       diagnostics: {
         counts: diagnosticCounts,
         schedules: diagnostics,

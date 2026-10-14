@@ -6,7 +6,8 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 240
 
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
-const REQUEST_TIMEOUT_MS = 12_000
+const REQUEST_TIMEOUT_MS = 6_000
+const FIRST_RESULT_GRACE_MS = 2_500
 const EPISODE_LOOKUP_TIMEOUT_MS = 8_000
 const STREAM_PROBE_TIMEOUT_MS = 4_000
 
@@ -260,20 +261,56 @@ function withProbeHeaders(headers: Record<string, unknown>) {
 }
 
 async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>) {
-  const responses = await Promise.allSettled(entries.map((entry) => fetchWatch(entry.episodeId ?? '')))
-  const candidates = responses.flatMap((settled, index) => {
-    if (settled.status !== 'fulfilled') return []
-    const provider = entries[index].provider ?? ''
-    const stream = qualify(settled.value, requireSubtitle, provider, excluded, entries[index].fallback === true)
-    return stream ? [{ provider, stream, intro: settled.value?.intro ?? null, outro: settled.value?.outro ?? null }] : []
-  })
-  if (candidates.length === 0) return null
+  type Winner = { provider: string; stream: NormalizedStream; intro: TimeRange | null; outro: TimeRange | null }
+  if (entries.length === 0) return null
 
-  const checked = await Promise.all(candidates.map(async (candidate) => ({
-    ...candidate,
-    usable: await probeStream(candidate.stream),
-  })))
-  return checked.find((candidate) => candidate.usable) ?? null
+  return new Promise<Winner | null>((resolve) => {
+    // undefined = still pending, null = failed or unusable
+    const results: Array<Winner | null | undefined> = new Array(entries.length).fill(undefined)
+    let done = false
+    let graceTimer: ReturnType<typeof setTimeout> | null = null
+
+    const finish = (value: Winner | null) => {
+      if (done) return
+      done = true
+      if (graceTimer) clearTimeout(graceTimer)
+      resolve(value)
+    }
+
+    const evaluate = (force: boolean) => {
+      if (done) return
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i]
+        if (result === undefined) {
+          if (force) continue
+          // A higher-priority provider is still pending. If a later one is already
+          // usable, give the earlier one a short grace period, then take what we have.
+          if (!graceTimer && results.some((item) => item)) {
+            graceTimer = setTimeout(() => evaluate(true), FIRST_RESULT_GRACE_MS)
+          }
+          return
+        }
+        if (result) return finish(result)
+      }
+      if (results.every((item) => item !== undefined)) finish(null)
+    }
+
+    entries.forEach((entry, index) => {
+      ;(async (): Promise<Winner | null> => {
+        const provider = entry.provider ?? ''
+        const body = await fetchWatch(entry.episodeId ?? '')
+        const stream = qualify(body, requireSubtitle, provider, excluded, entry.fallback === true)
+        if (!stream) return null
+        if (!(await probeStream(stream))) return null
+        return { provider, stream, intro: body?.intro ?? null, outro: body?.outro ?? null }
+      })()
+        .catch(() => null)
+        .then((result) => {
+          results[index] = result
+          evaluate(false)
+        })
+    })
+  })
 }
 
 export async function OPTIONS() {
@@ -352,10 +389,14 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   // providers (including Ani.pm) before declaring the episode unavailable.
   if (!subWinner && !dubWinner) {
     const discovered = providersFromCatalog(await fetchEpisodeCatalog(episode.anilist_id), episode.episode_number)
+    const triedSubCount = subProviders.length
+    const triedDubCount = dubProviders.length
     subProviders = mergeProviders(subProviders, discovered.sub)
     dubProviders = mergeProviders(dubProviders, discovered.dub)
-    subWinner = await findWinner(subProviders, true, excluded)
-    dubWinner = !subWinner ? await findWinner(dubProviders, false, excluded) : null
+    const newSub = subProviders.slice(triedSubCount)
+    const newDub = dubProviders.slice(triedDubCount)
+    subWinner = newSub.length > 0 ? await findWinner(newSub, true, excluded) : null
+    dubWinner = !subWinner && newDub.length > 0 ? await findWinner(newDub, false, excluded) : null
   }
 
   const winner = subWinner

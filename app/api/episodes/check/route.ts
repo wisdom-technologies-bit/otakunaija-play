@@ -15,7 +15,8 @@ const ANIVEXA_BASE = process.env.ANIVEXA_BASE_URL ?? 'https://anivexa.otakunaija
 const DEFAULT_BATCH = 8
 const MAX_BATCH = 25
 const CONCURRENCY = 3
-const DEADLINE_MS = 48_000 // stop starting new anime after this (maxDuration is 60s)
+const DEADLINE_MS = 20_000 // stop starting new anime after this (cron-job.org cuts responses at 30s)
+const MAX_FILL_WHEN_HAS_EPISODES = 100
 
 type FeedItem = {
   series_id: number
@@ -102,7 +103,7 @@ async function fetchAnivexaEpisodes(anilistId: number) {
   const res = await fetch(`${ANIVEXA_BASE}/episodes/${anilistId}`, {
     headers: { accept: 'application/json' },
     cache: 'no-store',
-    signal: AbortSignal.timeout(25_000),
+    signal: AbortSignal.timeout(15_000),
   })
   if (!res.ok) throw new Error(`anivexa HTTP ${res.status}`)
   const json = (await res.json()) as Record<string, any>
@@ -149,9 +150,15 @@ async function checkOne(item: FeedItem, quorumOverride: number | null) {
   const minAgree = quorumOverride ?? (providersWithData >= 2 ? 2 : 1)
   const tomorrow = Date.now() + 86_400_000
 
+  // Never backfill history below what OtakuNaija already has (e.g. Detective Conan
+  // starting at 1214 must not pull 1..1213). We only fill gaps between the lowest and
+  // highest episode we have, plus everything above. With zero episodes, take all.
+  const lowerBound = have.size > 0 ? Math.min(...have) : 1
+
   const missing: number[] = []
   for (const [n, f] of found) {
     if (have.has(n)) continue
+    if (n < lowerBound) continue
     if (f.count < minAgree) continue
     const t = f.airDate ? Date.parse(f.airDate) : NaN
     if (Number.isFinite(t) && t > tomorrow) continue // not aired yet
@@ -159,7 +166,10 @@ async function checkOne(item: FeedItem, quorumOverride: number | null) {
   }
   missing.sort((a, b) => a - b)
 
-  const entries = missing.map((episode_number) => ({ anilist_id: item.anilist_id, episode_number }))
+  // Safety valve: an anime that already has episodes should never need a huge fill.
+  // If it does, the remainder is picked up on its next turn in the rotation.
+  const toInsert = have.size > 0 ? missing.slice(0, MAX_FILL_WHEN_HAS_EPISODES) : missing
+  const entries = toInsert.map((episode_number) => ({ anilist_id: item.anilist_id, episode_number }))
   let inserted = 0
   let alreadyKnown = 0
   if (entries.length) {
@@ -220,7 +230,8 @@ export async function GET(request: Request) {
             title: item.title,
             haveLatest: item.latest_episode,
             haveCount: item.episode_count,
-            missing: r.missing,
+            missingCount: r.missing.length,
+            missingSample: r.missing.slice(0, 20),
             providersWithData: r.providersWithData,
             minAgree: r.minAgree,
             inserted: r.inserted,

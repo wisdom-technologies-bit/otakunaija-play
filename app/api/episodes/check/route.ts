@@ -8,14 +8,14 @@ import {
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 60
+export const maxDuration = 240
 
 const OTAKUNAIJA_BASE = process.env.OTAKUNAIJA_BASE_URL ?? 'https://otakunaija.name.ng'
 const ANIVEXA_BASE = process.env.ANIVEXA_BASE_URL ?? 'https://anivexa.otakunaija.name.ng'
 const DEFAULT_BATCH = 8
 const MAX_BATCH = 25
 const CONCURRENCY = 3
-const DEADLINE_MS = 20_000 // stop starting new anime after this (cron-job.org cuts responses at 30s)
+const DEADLINE_MS = 60_000 // stop starting new anime after this (cron-job.org cuts responses at 30s)
 const MAX_FILL_WHEN_HAS_EPISODES = 100
 
 type FeedItem = {

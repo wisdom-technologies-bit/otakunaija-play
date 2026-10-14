@@ -215,9 +215,10 @@ async function probeStream(stream: NormalizedStream, provider: string): Promise<
     return result
   }
   try {
+    const headers = withProbeHeaders(stream.headers)
     const response = await fetch(stream.streamUrl, {
       method: 'GET',
-      headers: stream.headers as Record<string, string>,
+      headers,
       signal: controller.signal,
       cache: 'no-store',
     })

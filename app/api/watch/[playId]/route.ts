@@ -6,9 +6,9 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 240
 
 const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
-const REQUEST_TIMEOUT_MS = 12_000
-const EPISODE_LOOKUP_TIMEOUT_MS = 8_000
-const STREAM_PROBE_TIMEOUT_MS = 9_000
+const REQUEST_TIMEOUT_MS = 6_000
+const EPISODE_LOOKUP_TIMEOUT_MS = 5_000
+const STREAM_PROBE_TIMEOUT_MS = 4_000
 
 const SUBTITLE_LABEL_TO_SRCLANG: Record<string, string> = {
   english: 'en',
@@ -211,90 +211,47 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
 async function probeStream(
   stream: NormalizedStream,
   provider: string,
-  proxyOrigin: string,
+  _proxyOrigin: string,
 ): Promise<{ usable: boolean; reason?: string }> {
-  const finish = (result: { usable: boolean; reason?: string }) => {
-    // Never log signed stream URLs: their tokens may be in the URL path.
-    let host = 'unknown'
-    try {
-      host = new URL(stream.streamUrl).hostname
-    } catch {
-      // Keep the host as unknown if the URL is malformed.
-    }
-
-    console.log('[watch] stream probe', {
-      provider,
-      host,
-      ...result,
-    })
-
-    return result
-  }
-
-  let streamHost = ''
+  // Single upstream check only. No second fetch through our own proxy: it
+  // doubled latency and broke on tokenized manifest URLs.
+  let host = 'unknown'
   try {
-    streamHost = new URL(stream.streamUrl).hostname.toLowerCase()
+    host = new URL(stream.streamUrl).hostname
   } catch {
-    return finish({ usable: false, reason: 'invalid_url' })
+    return { usable: false, reason: 'invalid_url' }
   }
 
   const controller = new AbortController()
-  const timeout = setTimeout(
-    () => controller.abort(),
-    STREAM_PROBE_TIMEOUT_MS,
-  )
+  const timeout = setTimeout(() => controller.abort(), STREAM_PROBE_TIMEOUT_MS)
+  let result: { usable: boolean; reason?: string }
 
   try {
-    const upstreamResponse = await fetch(stream.streamUrl, {
+    const res = await fetch(stream.streamUrl, {
       method: 'GET',
       headers: withProbeHeaders(stream.headers),
       signal: controller.signal,
       cache: 'no-store',
     })
-
-    if (!upstreamResponse.ok) {
-      return finish({
-        usable: false,
-        reason: `http_${upstreamResponse.status}`,
-      })
+    if (!res.ok) {
+      result = { usable: false, reason: `http_${res.status}` }
+    } else if (stream.type === 'hls' || stream.streamUrl.toLowerCase().includes('.m3u8')) {
+      const text = await res.text()
+      result = text.includes('#EXTM3U') ? { usable: true } : { usable: false, reason: 'no_extm3u_marker' }
+    } else {
+      await res.body?.cancel()
+      result = { usable: true }
     }
-
-    if (
-      stream.type !== 'hls' &&
-      !stream.streamUrl.toLowerCase().includes('.m3u8')
-    ) {
-      return finish({ usable: true })
-    }
-
-    const sample = await upstreamResponse.text()
-    if (!sample.includes('#EXTM3U')) {
-      return finish({ usable: false, reason: 'no_extm3u_marker' })
-    }
-
-    // Probe the exact signed manifest URL returned to the client. A provider
-    // is not a winner when our proxy cannot fetch and rewrite its manifest.
-    const signedProxyUrl = await signProxyUrl(stream.streamUrl, withProbeHeaders(stream.headers), '/api/proxy/manifest')
-    const proxyResponse = await fetch(new URL(signedProxyUrl, proxyOrigin), { signal: controller.signal, cache: 'no-store' })
-    if (!proxyResponse.ok) {
-      return finish({ usable: false, reason: `proxy_http_${proxyResponse.status}` })
-    }
-    const proxySample = await proxyResponse.text()
-    if (!proxySample.includes('#EXTM3U')) {
-      return finish({ usable: false, reason: 'proxy_no_extm3u_marker' })
-    }
-
-    return sample.includes('#EXTM3U')
-      ? finish({ usable: true })
-      : finish({ usable: false, reason: 'no_extm3u_marker' })
   } catch (error) {
-    return finish(
-      error instanceof DOMException && error.name === 'AbortError'
-        ? { usable: false, reason: 'timeout' }
-        : { usable: false, reason: 'request_failed' },
-    )
+    result = error instanceof DOMException && error.name === 'AbortError'
+      ? { usable: false, reason: 'timeout' }
+      : { usable: false, reason: 'request_failed' }
   } finally {
     clearTimeout(timeout)
   }
+
+  console.log('[watch] stream probe', { provider, host, ...result })
+  return result
 }
 
 function withProbeHeaders(headers: Record<string, unknown>) {
@@ -308,39 +265,39 @@ function withProbeHeaders(headers: Record<string, unknown>) {
   return result
 }
 
+type Winner = { provider: string; stream: NormalizedStream; intro: TimeRange | null; outro: TimeRange | null }
+
+async function tryEntry(entry: ProviderEntry, requireSubtitle: boolean, excluded: Set<string>, proxyOrigin: string): Promise<Winner | null> {
+  const provider = entry.provider ?? ''
+  const body = await fetchWatch(entry.episodeId ?? '')
+  const stream = qualify(body, requireSubtitle, provider, excluded)
+  if (!stream) return null
+  const probe = await probeStream(stream, provider, proxyOrigin)
+  return probe.usable ? { provider, stream, intro: body?.intro ?? null, outro: body?.outro ?? null } : null
+}
+
+function firstWinner(tasks: Promise<Winner | null>[]): Promise<Winner | null> {
+  return new Promise((resolve) => {
+    if (tasks.length === 0) return resolve(null)
+    let pending = tasks.length
+    for (const task of tasks) {
+      task
+        .then((result) => { if (result) resolve(result) })
+        .catch(() => {})
+        .finally(() => {
+          pending -= 1
+          if (pending === 0) resolve(null)
+        })
+    }
+  })
+}
+
 async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>, proxyOrigin: string) {
-  const orderedEntries = entries.filter((entry) => entry.provider?.toLowerCase() !== 'anipm')
-  const anipmEntries = entries.filter((entry) => entry.provider?.toLowerCase() === 'anipm')
-  const responses = await Promise.allSettled(orderedEntries.map((entry) => fetchWatch(entry.episodeId ?? '')))
-  const candidates = responses.flatMap((settled, index) => {
-    if (settled.status !== 'fulfilled') return []
-    const provider = orderedEntries[index].provider ?? ''
-    const stream = qualify(settled.value, requireSubtitle, provider, excluded)
-    return stream ? [{ provider, stream, intro: settled.value?.intro ?? null, outro: settled.value?.outro ?? null }] : []
-  })
-
-  const checked = await Promise.all(candidates.map(async (candidate) => ({
-    ...candidate,
-    probe: await probeStream(candidate.stream, candidate.provider, proxyOrigin),
-  })))
-  const winner = checked.find((candidate) => candidate.probe.usable === true)
-  if (winner) return winner
-
-  // Ani.pm is intentionally a last-resort provider. It should not win while
-  // another provider has a usable stream, but it remains available when all
-  // preferred providers fail or omit the requested subtitle tracks.
-  const fallbackResponses = await Promise.allSettled(anipmEntries.map((entry) => fetchWatch(entry.episodeId ?? '')))
-  const fallbackCandidates = fallbackResponses.flatMap((settled, index) => {
-    if (settled.status !== 'fulfilled') return []
-    const provider = anipmEntries[index].provider ?? 'anipm'
-    const stream = qualify(settled.value, requireSubtitle, provider, excluded)
-    return stream ? [{ provider, stream, intro: settled.value?.intro ?? null, outro: settled.value?.outro ?? null }] : []
-  })
-  const fallbackChecked = await Promise.all(fallbackCandidates.map(async (candidate) => ({
-    ...candidate,
-    probe: await probeStream(candidate.stream, candidate.provider, proxyOrigin),
-  })))
-  return fallbackChecked.find((candidate) => candidate.probe.usable === true) ?? null
+  const isAnipm = (entry: ProviderEntry) => entry.provider?.toLowerCase() === 'anipm'
+  // Ani.pm still runs in parallel but only counts if no other provider wins.
+  const anipmTask = firstWinner(entries.filter(isAnipm).map((entry) => tryEntry(entry, requireSubtitle, excluded, proxyOrigin)))
+  const preferred = await firstWinner(entries.filter((entry) => !isAnipm(entry)).map((entry) => tryEntry(entry, requireSubtitle, excluded, proxyOrigin)))
+  return preferred ?? (await anipmTask)
 }
 
 export async function OPTIONS() {

@@ -9,21 +9,31 @@ import {
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 60
+export const maxDuration = 240
 
 const OTAKUNAIJA_BASE = process.env.OTAKUNAIJA_BASE_URL ?? 'https://otakunaija.name.ng'
 const ANIVEXA_BASE = process.env.ANIVEXA_BASE_URL ?? 'https://anivexa.otakunaija.name.ng'
+
 const DEFAULT_BATCH = 12
 const MAX_BATCH = 25
+
+// How many anime are checked in parallel. 4 is a safe default for Anivexa.
 const CONCURRENCY = Number(process.env.EPISODE_CHECK_CONCURRENCY) || 4
+
+// Safety valve: an anime that already has episodes should never need a huge fill.
 const MAX_FILL_WHEN_HAS_EPISODES = 100
-// Optional: comma-separated provider slugs, e.g. "mkissa,anikoto,animegg,aniwaves,senshi,anipm".
+
+// Optional: comma-separated provider slugs, e.g. "mkissa,anikoto,animegg".
 // When set, only those providers are queried (much faster than asking all 12).
 const ANIVEXA_PROVIDERS = (process.env.ANIVEXA_PROVIDERS ?? '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean)
 const ANIVEXA_TIMEOUT_MS = Number(process.env.ANIVEXA_TIMEOUT_MS) || 25_000
+
+// Wall-clock budgets. Vercel maxDuration is 60s.
+const SYNC_BUDGET_MS = 26_000 // ?wait=1 manual runs (Termux)
+const ASYNC_BUDGET_MS = 55_000 // background runs via after()
 
 type FeedItem = {
   series_id: number
@@ -77,10 +87,10 @@ function supabaseUrl(path: string) {
 }
 
 async function loadState(): Promise<Map<number, number>> {
-  const res = await fetch(supabaseUrl('episode_check_state?select=anilist_id,last_checked_at&limit=5000'), {
-    headers: supabaseHeaders(),
-    cache: 'no-store',
-  })
+  const res = await fetch(
+    supabaseUrl('episode_check_state?select=anilist_id,last_checked_at&limit=5000'),
+    { headers: supabaseHeaders(), cache: 'no-store' },
+  )
   if (!res.ok) throw new Error(`state read HTTP ${res.status}`)
   const rows = (await res.json()) as { anilist_id: number; last_checked_at: string }[]
   return new Map(rows.map((r) => [r.anilist_id, Date.parse(r.last_checked_at)]))
@@ -176,8 +186,6 @@ async function checkOne(item: FeedItem, quorumOverride: number | null) {
   }
   missing.sort((a, b) => a - b)
 
-  // Safety valve: an anime that already has episodes should never need a huge fill.
-  // If it does, the remainder is picked up on its next turn in the rotation.
   const toInsert = have.size > 0 ? missing.slice(0, MAX_FILL_WHEN_HAS_EPISODES) : missing
   const entries = toInsert.map((episode_number) => ({ anilist_id: item.anilist_id, episode_number }))
   let inserted = 0
@@ -191,10 +199,7 @@ async function checkOne(item: FeedItem, quorumOverride: number | null) {
   return { missing, providersWithData, minAgree, inserted, alreadyKnown }
 }
 
-// ---------- Route ----------
-
-const SYNC_BUDGET_MS = 26_000 // ?wait=1 manual runs
-const ASYNC_BUDGET_MS = 55_000 // background runs (maxDuration is 60s)
+// ---------- Runner ----------
 
 async function runCheck(batch: number, quorumOverride: number | null, budgetMs: number) {
   const started = Date.now()
@@ -262,6 +267,15 @@ async function runCheck(batch: number, quorumOverride: number | null, budgetMs: 
   }
 }
 
+// ---------- Route ----------
+//
+// Two run modes:
+//   1) Default (cron):    responds 202 immediately, then keeps working in the background
+//                         via Next's after(). The Vercel function stays alive up to 55s.
+//                         cron-job.org's 30s cutoff won't kill it.
+//   2) ?wait=1 (manual):  runs synchronously inside the request and returns the full
+//                         results as JSON. Use this from Termux for testing.
+
 export async function GET(request: Request) {
   const secret = process.env.EPISODE_CHECK_SECRET
   if (secret && request.headers.get('authorization') !== `Bearer ${secret}`) {
@@ -273,7 +287,7 @@ export async function GET(request: Request) {
   const quorumParam = Number(params.get('quorum'))
   const quorumOverride = quorumParam >= 1 ? quorumParam : null
 
-  // Manual testing: ?wait=1 runs inline and returns the full results.
+  // Mode 2: synchronous, full results. For manual testing (e.g. Termux).
   if (params.get('wait') === '1') {
     try {
       return Response.json(await runCheck(batch, quorumOverride, SYNC_BUDGET_MS))
@@ -282,7 +296,7 @@ export async function GET(request: Request) {
     }
   }
 
-  // Cron: answer immediately (cron-job.org cuts off at 30s) and keep working in the background.
+  // Mode 1: reply 202 right away, keep working in the background.
   after(async () => {
     try {
       const r = await runCheck(batch, quorumOverride, ASYNC_BUDGET_MS)
@@ -300,5 +314,5 @@ export async function GET(request: Request) {
       console.error('episode-check failed', getErrorMessage(error))
     }
   })
-  return Response.json({ accepted: true, batch }, { status: 202 })
+  return Response.json({ accepted: true, batch, concurrency: CONCURRENCY }, { status: 202 })
 }

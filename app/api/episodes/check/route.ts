@@ -8,15 +8,22 @@ import {
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 240
+export const maxDuration = 60
 
 const OTAKUNAIJA_BASE = process.env.OTAKUNAIJA_BASE_URL ?? 'https://otakunaija.name.ng'
 const ANIVEXA_BASE = process.env.ANIVEXA_BASE_URL ?? 'https://anivexa.otakunaija.name.ng'
 const DEFAULT_BATCH = 8
 const MAX_BATCH = 25
 const CONCURRENCY = 3
-const DEADLINE_MS = 60_000 // stop starting new anime after this (cron-job.org cuts responses at 30s)
+const DEADLINE_MS = 120_000 // stop starting new anime after this (cron-job.org cuts responses at 30s)
 const MAX_FILL_WHEN_HAS_EPISODES = 100
+// Optional: comma-separated provider slugs, e.g. "mkissa,anikoto,animegg,aniwaves,senshi,anipm".
+// When set, only those providers are queried (much faster than asking all 12).
+const ANIVEXA_PROVIDERS = (process.env.ANIVEXA_PROVIDERS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+const ANIVEXA_TIMEOUT_MS = Number(process.env.ANIVEXA_TIMEOUT_MS) || 15_000
 
 type FeedItem = {
   series_id: number
@@ -100,10 +107,13 @@ async function stamp(anilistId: number, lastMissing: number, lastError: string |
 const NON_PROVIDER_KEYS = new Set(['mappings', 'page', 'type'])
 
 async function fetchAnivexaEpisodes(anilistId: number) {
-  const res = await fetch(`${ANIVEXA_BASE}/episodes/${anilistId}`, {
+  const path = ANIVEXA_PROVIDERS.length
+    ? `/episodes/${ANIVEXA_PROVIDERS.join('/')}/${anilistId}?map=false`
+    : `/episodes/${anilistId}`
+  const res = await fetch(`${ANIVEXA_BASE}${path}`, {
     headers: { accept: 'application/json' },
     cache: 'no-store',
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(ANIVEXA_TIMEOUT_MS),
   })
   if (!res.ok) throw new Error(`anivexa HTTP ${res.status}`)
   const json = (await res.json()) as Record<string, any>

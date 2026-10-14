@@ -211,6 +211,7 @@ async function responseFor(playId: string, audio: 'sub' | 'dub', provider: strin
 async function probeStream(
   stream: NormalizedStream,
   provider: string,
+  proxyOrigin: string,
 ): Promise<{ usable: boolean; reason?: string }> {
   const finish = (result: { usable: boolean; reason?: string }) => {
     // Never log signed stream URLs: their tokens may be in the URL path.
@@ -237,16 +238,6 @@ async function probeStream(
     return finish({ usable: false, reason: 'invalid_url' })
   }
 
-  // Settlar may reject server-side availability probes even when
-  // the provider returns a candidate intended for playback.
-  // Skip probing only for Ani.pm's known Settlar stream host.
-  if (provider.toLowerCase() === 'anipm' && streamHost === 'media.settlar.io') {
-    return finish({
-      usable: true,
-      reason: 'provider_probe_skipped',
-    })
-  }
-
   const controller = new AbortController()
   const timeout = setTimeout(
     () => controller.abort(),
@@ -254,17 +245,17 @@ async function probeStream(
   )
 
   try {
-    const response = await fetch(stream.streamUrl, {
+    const upstreamResponse = await fetch(stream.streamUrl, {
       method: 'GET',
       headers: withProbeHeaders(stream.headers),
       signal: controller.signal,
       cache: 'no-store',
     })
 
-    if (!response.ok) {
+    if (!upstreamResponse.ok) {
       return finish({
         usable: false,
-        reason: `http_${response.status}`,
+        reason: `http_${upstreamResponse.status}`,
       })
     }
 
@@ -275,7 +266,22 @@ async function probeStream(
       return finish({ usable: true })
     }
 
-    const sample = await response.text()
+    const sample = await upstreamResponse.text()
+    if (!sample.includes('#EXTM3U')) {
+      return finish({ usable: false, reason: 'no_extm3u_marker' })
+    }
+
+    // Probe the exact signed manifest URL returned to the client. A provider
+    // is not a winner when our proxy cannot fetch and rewrite its manifest.
+    const signedProxyUrl = await signProxyUrl(stream.streamUrl, withProbeHeaders(stream.headers), '/api/proxy/manifest')
+    const proxyResponse = await fetch(new URL(signedProxyUrl, proxyOrigin), { signal: controller.signal, cache: 'no-store' })
+    if (!proxyResponse.ok) {
+      return finish({ usable: false, reason: `proxy_http_${proxyResponse.status}` })
+    }
+    const proxySample = await proxyResponse.text()
+    if (!proxySample.includes('#EXTM3U')) {
+      return finish({ usable: false, reason: 'proxy_no_extm3u_marker' })
+    }
 
     return sample.includes('#EXTM3U')
       ? finish({ usable: true })
@@ -302,7 +308,7 @@ function withProbeHeaders(headers: Record<string, unknown>) {
   return result
 }
 
-async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>) {
+async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, excluded: Set<string>, proxyOrigin: string) {
   const orderedEntries = entries.filter((entry) => entry.provider?.toLowerCase() !== 'anipm')
   const anipmEntries = entries.filter((entry) => entry.provider?.toLowerCase() === 'anipm')
   const responses = await Promise.allSettled(orderedEntries.map((entry) => fetchWatch(entry.episodeId ?? '')))
@@ -315,7 +321,7 @@ async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, ex
 
   const checked = await Promise.all(candidates.map(async (candidate) => ({
     ...candidate,
-    probe: await probeStream(candidate.stream, candidate.provider),
+    probe: await probeStream(candidate.stream, candidate.provider, proxyOrigin),
   })))
   const winner = checked.find((candidate) => candidate.probe.usable === true)
   if (winner) return winner
@@ -332,7 +338,7 @@ async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, ex
   })
   const fallbackChecked = await Promise.all(fallbackCandidates.map(async (candidate) => ({
     ...candidate,
-    probe: await probeStream(candidate.stream, candidate.provider),
+    probe: await probeStream(candidate.stream, candidate.provider, proxyOrigin),
   })))
   return fallbackChecked.find((candidate) => candidate.probe.usable === true) ?? null
 }
@@ -391,7 +397,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
       const cachedResponse = await fetchWatch(cached.episodeId)
       const stream = qualify(cachedResponse, episode.resolved_audio === 'sub', episode.resolved_provider, excluded)
       if (stream) {
-        const probe = await probeStream(stream, episode.resolved_provider)
+        const probe = await probeStream(stream, episode.resolved_provider, new URL(_request.url).origin)
         if (probe.usable) {
           if (episode.needs_resync) {
             const { error: resyncClearError } = await supabase
@@ -406,8 +412,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     }
   }
 
-  let subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded) : null
-  let dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded) : null
+  let subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded, new URL(_request.url).origin) : null
+  let dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded, new URL(_request.url).origin) : null
 
   // Provider availability can change without the episode row being resynced. If
   // the stored providers fail, refresh the catalog and retry newly discovered
@@ -416,8 +422,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     const discovered = providersFromCatalog(await fetchEpisodeCatalog(episode.anilist_id), episode.episode_number)
     subProviders = mergeProviders(subProviders, discovered.sub)
     dubProviders = mergeProviders(dubProviders, discovered.dub)
-    subWinner = await findWinner(subProviders, true, excluded)
-    dubWinner = !subWinner ? await findWinner(dubProviders, false, excluded) : null
+    subWinner = await findWinner(subProviders, true, excluded, new URL(_request.url).origin)
+    dubWinner = !subWinner ? await findWinner(dubProviders, false, excluded, new URL(_request.url).origin) : null
   }
 
   const winner = subWinner

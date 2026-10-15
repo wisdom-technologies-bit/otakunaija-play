@@ -104,8 +104,10 @@ async function stamp(anilistId: number, lastMissing: number, lastError: string |
 
 const NON_PROVIDER_KEYS = new Set(['mappings', 'page', 'type'])
 
-// Every integer episode number any provider lists (sub or dub). Nothing else is read.
-async function fetchEpisodeNumbers(anilistId: number): Promise<Set<number>> {
+// Episode number -> how many providers list it (sub and dub count once per provider).
+async function fetchEpisodeNumbers(
+  anilistId: number,
+): Promise<{ counts: Map<number, number>; providersWithData: number }> {
   const res = await fetch(ANIVEXA_BASE + '/episodes/' + anilistId, {
     headers: { accept: 'application/json' },
     cache: 'no-store',
@@ -114,18 +116,23 @@ async function fetchEpisodeNumbers(anilistId: number): Promise<Set<number>> {
   if (!res.ok) throw new Error(`anivexa HTTP ${res.status}`)
   const json = (await res.json()) as Record<string, any>
 
-  const numbers = new Set<number>()
+  const counts = new Map<number, number>()
+  let providersWithData = 0
   for (const [key, val] of Object.entries(json)) {
     if (NON_PROVIDER_KEYS.has(key) || !val || typeof val !== 'object') continue
+    const seen = new Set<number>()
     for (const list of [val.episodes?.sub, val.episodes?.dub]) {
       if (!Array.isArray(list)) continue
       for (const e of list) {
         const n = Number(e?.number)
-        if (Number.isInteger(n) && n >= 1) numbers.add(n)
+        if (Number.isInteger(n) && n >= 1) seen.add(n)
       }
     }
+    if (seen.size === 0) continue
+    providersWithData += 1
+    for (const n of seen) counts.set(n, (counts.get(n) ?? 0) + 1)
   }
-  return numbers
+  return { counts, providersWithData }
 }
 
 // ---------- Runner ----------
@@ -155,12 +162,15 @@ async function runCheck(batch: number) {
       if (!item) return
       try {
         const have = new Set(item.episode_numbers)
-        const numbers = await fetchEpisodeNumbers(item.anilist_id)
+        const { counts, providersWithData } = await fetchEpisodeNumbers(item.anilist_id)
+        // 2+ providers answered = an episode needs 2 of them to list it.
+        const minAgree = providersWithData >= 2 ? 2 : 1
         // Fill gaps and everything above, but never below the lowest episode OtakuNaija has.
         // No episodes yet = take everything.
         const lowerBound = have.size > 0 ? Math.min(...have) : 1
-        const missing = [...numbers]
-          .filter((n) => n >= lowerBound && !have.has(n))
+        const missing = [...counts]
+          .filter(([n, c]) => c >= minAgree && n >= lowerBound && !have.has(n))
+          .map(([n]) => n)
           .sort((a, b) => a - b)
         for (const episode_number of missing) {
           entries.push({ anilist_id: item.anilist_id, episode_number })

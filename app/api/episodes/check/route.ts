@@ -137,7 +137,7 @@ async function fetchEpisodeNumbers(
 
 // ---------- Runner ----------
 
-async function runCheck(batch: number) {
+async function runCheck(batch: number, onlyId: number | null = null) {
   const started = Date.now()
   const [feed, state] = await Promise.all([fetchFeed(), loadState()])
 
@@ -147,7 +147,7 @@ async function runCheck(batch: number) {
     const tb = state.get(b.anilist_id) ?? 0
     return ta - tb || a.anilist_id - b.anilist_id
   })
-  const picked = queue.slice(0, batch)
+  const picked = onlyId ? feed.filter((f) => f.anilist_id === onlyId) : queue.slice(0, batch)
   const neverChecked = feed.filter((f) => !state.has(f.anilist_id)).length
 
   const entries: { anilist_id: number; episode_number: number }[] = []
@@ -223,11 +223,13 @@ export async function GET(request: Request) {
 
   const params = new URL(request.url).searchParams
   const batch = Math.min(Math.max(Number(params.get('batch')) || DEFAULT_BATCH, 1), MAX_BATCH)
+  const idParam = Number(params.get('id'))
+  const onlyId = idParam > 0 ? idParam : null
 
   // Manual: run inside the request and return full results.
   if (params.get('wait') === '1') {
     try {
-      return Response.json(await runCheck(batch))
+      return Response.json(await runCheck(batch, onlyId))
     } catch (error) {
       return jsonError(getErrorMessage(error))
     }

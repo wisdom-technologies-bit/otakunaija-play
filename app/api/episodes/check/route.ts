@@ -71,7 +71,7 @@ function supabaseHeaders() {
 function supabaseUrl(path: string) {
   const base = process.env.NEXT_PUBLIC_SUPABASE_URL ?? process.env.SUPABASE_URL
   if (!base) throw new Error('NEXT_PUBLIC_SUPABASE_URL is not set')
-  return `\( {base}/rest/v1/ \){path}`
+  return base.replace(/\/+$/, '') + '/rest/v1/' + path
 }
 
 async function loadState(): Promise<Map<number, number>> {
@@ -106,7 +106,7 @@ const NON_PROVIDER_KEYS = new Set(['mappings', 'page', 'type'])
 
 // Every integer episode number any provider lists (sub or dub). Nothing else is read.
 async function fetchEpisodeNumbers(anilistId: number): Promise<Set<number>> {
-  const res = await fetch(`\( {ANIVEXA_BASE}/episodes/ \){anilistId}`, {
+  const res = await fetch(ANIVEXA_BASE + '/episodes/' + anilistId, {
     headers: { accept: 'application/json' },
     cache: 'no-store',
     signal: AbortSignal.timeout(ANIVEXA_TIMEOUT_MS),
@@ -120,7 +120,7 @@ async function fetchEpisodeNumbers(anilistId: number): Promise<Set<number>> {
     for (const list of [val.episodes?.sub, val.episodes?.dub]) {
       if (!Array.isArray(list)) continue
       for (const e of list) {
-        const n = Number(e?.number)
+        the n = Number(e?.number)
         if (Number.isInteger(n) && n >= 1) numbers.add(n)
       }
     }
@@ -196,7 +196,7 @@ async function runCheck(batch: number) {
     batchRequested: batch,
     checked: results.length,
     missingFound: deduped.length,
-    alreadyKnown: deduped.filter((e) => existingKeys.has(`\( {e.anilist_id}- \){e.episode_number}`)).length,
+    alreadyKnown: deduped.filter((e) => existingKeys.has(e.anilist_id + '-' + e.episode_number)).length,
     pendingSyncInserted: inserted,
     tookMs: Date.now() - started,
     results,

@@ -20,24 +20,10 @@ const MAX_BATCH = 25
 // How many anime are checked in parallel. 4 is a safe default for Anivexa.
 const CONCURRENCY = Number(process.env.EPISODE_CHECK_CONCURRENCY) || 4
 
-// Safety valve: an anime that already has episodes should never need a huge fill.
-const MAX_FILL_WHEN_HAS_EPISODES = 100
-
-// Optional: comma-separated provider slugs, e.g. "mkissa,anikoto,animegg".
-// When set, only those providers are queried (much faster than asking all 12).
-const ANIVEXA_PROVIDERS = (process.env.ANIVEXA_PROVIDERS ?? '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean)
-
 // Per-request timeout for Anivexa. Must stay well under the run budgets below,
 // because the worker start-gate uses this value to decide whether it can still
 // fit one more anime inside the wall-clock budget.
 const ANIVEXA_TIMEOUT_MS = Number(process.env.ANIVEXA_TIMEOUT_MS) || 45_000
-
-// Wall-clock budgets. Vercel maxDuration is 240s.
-const SYNC_BUDGET_MS = 200_000 // ?wait=1 manual runs (Termux)
-const ASYNC_BUDGET_MS = 220_000 // background runs via after()
 
 type FeedItem = {
   series_id: number
@@ -48,8 +34,6 @@ type FeedItem = {
   latest_episode: number | null
   episode_count: number
 }
-
-type Found = { count: number; airDate: string | null }
 
 // ---------- OtakuNaija feed ----------
 
@@ -87,7 +71,7 @@ function supabaseHeaders() {
 function supabaseUrl(path: string) {
   const base = process.env.NEXT_PUBLIC_SUPABASE_URL ?? process.env.SUPABASE_URL
   if (!base) throw new Error('NEXT_PUBLIC_SUPABASE_URL is not set')
-  return `${base}/rest/v1/${path}`
+  return `\( {base}/rest/v1/ \){path}`
 }
 
 async function loadState(): Promise<Map<number, number>> {
@@ -120,11 +104,9 @@ async function stamp(anilistId: number, lastMissing: number, lastError: string |
 
 const NON_PROVIDER_KEYS = new Set(['mappings', 'page', 'type'])
 
-async function fetchAnivexaEpisodes(anilistId: number) {
-  const path = ANIVEXA_PROVIDERS.length
-    ? `/episodes/${ANIVEXA_PROVIDERS.join('/')}/${anilistId}?map=false`
-    : `/episodes/${anilistId}`
-  const res = await fetch(`${ANIVEXA_BASE}${path}`, {
+// Every integer episode number any provider lists (sub or dub). Nothing else is read.
+async function fetchEpisodeNumbers(anilistId: number): Promise<Set<number>> {
+  const res = await fetch(`\( {ANIVEXA_BASE}/episodes/ \){anilistId}`, {
     headers: { accept: 'application/json' },
     cache: 'no-store',
     signal: AbortSignal.timeout(ANIVEXA_TIMEOUT_MS),
@@ -132,85 +114,27 @@ async function fetchAnivexaEpisodes(anilistId: number) {
   if (!res.ok) throw new Error(`anivexa HTTP ${res.status}`)
   const json = (await res.json()) as Record<string, any>
 
-  const found = new Map<number, Found>()
-  let providersWithData = 0
-
+  const numbers = new Set<number>()
   for (const [key, val] of Object.entries(json)) {
     if (NON_PROVIDER_KEYS.has(key) || !val || typeof val !== 'object') continue
-    const eps = val.episodes
-    if (!eps || typeof eps !== 'object') continue // provider returned { error }
-
-    const seenByProvider = new Map<number, string | null>()
-    for (const list of [eps.sub, eps.dub]) {
+    for (const list of [val.episodes?.sub, val.episodes?.dub]) {
       if (!Array.isArray(list)) continue
       for (const e of list) {
         const n = Number(e?.number)
-        // OtakuNaija stores integer episode numbers; skip 0 and fractional (13.5) entries
-        if (!Number.isInteger(n) || n < 1) continue
-        if (!seenByProvider.has(n) || !seenByProvider.get(n)) seenByProvider.set(n, e?.airDate ?? null)
+        if (Number.isInteger(n) && n >= 1) numbers.add(n)
       }
     }
-    if (seenByProvider.size === 0) continue
-    providersWithData += 1
-    for (const [n, airDate] of seenByProvider) {
-      const prev = found.get(n)
-      found.set(n, {
-        count: (prev?.count ?? 0) + 1,
-        airDate: prev?.airDate ?? airDate,
-      })
-    }
   }
-  return { found, providersWithData }
-}
-
-// ---------- Per-anime check ----------
-
-async function checkOne(item: FeedItem, quorumOverride: number | null) {
-  const have = new Set(item.episode_numbers)
-  const { found, providersWithData } = await fetchAnivexaEpisodes(item.anilist_id)
-
-  // Providers sometimes match the wrong season or use absolute numbering, so when
-  // 2+ providers answered we require 2 of them to agree on an episode number.
-  const minAgree = quorumOverride ?? (providersWithData >= 2 ? 2 : 1)
-  const tomorrow = Date.now() + 86_400_000
-
-  // Never backfill history below what OtakuNaija already has (e.g. Detective Conan
-  // starting at 1214 must not pull 1..1213). We only fill gaps between the lowest and
-  // highest episode we have, plus everything above. With zero episodes, take all.
-  const lowerBound = have.size > 0 ? Math.min(...have) : 1
-
-  const missing: number[] = []
-  for (const [n, f] of found) {
-    if (have.has(n)) continue
-    if (n < lowerBound) continue
-    if (f.count < minAgree) continue
-    const t = f.airDate ? Date.parse(f.airDate) : NaN
-    if (Number.isFinite(t) && t > tomorrow) continue // not aired yet
-    missing.push(n)
-  }
-  missing.sort((a, b) => a - b)
-
-  const toInsert = have.size > 0 ? missing.slice(0, MAX_FILL_WHEN_HAS_EPISODES) : missing
-  const entries = toInsert.map((episode_number) => ({ anilist_id: item.anilist_id, episode_number }))
-  let inserted = 0
-  let alreadyKnown = 0
-  if (entries.length) {
-    const deduped = deduplicateEntries(entries)
-    const existing = await findExistingPendingSyncEntries(deduped)
-    alreadyKnown = deduped.filter((e) => existing.has(`${e.anilist_id}-${e.episode_number}`)).length
-    inserted = await insertPendingSync(deduped)
-  }
-  return { missing, providersWithData, minAgree, inserted, alreadyKnown }
+  return numbers
 }
 
 // ---------- Runner ----------
 
-async function runCheck(batch: number, quorumOverride: number | null, budgetMs: number) {
+async function runCheck(batch: number) {
   const started = Date.now()
   const [feed, state] = await Promise.all([fetchFeed(), loadState()])
 
-  // Never-checked first (no state row), then oldest last_checked_at.
-  // This guarantees every anime is checked once before any is checked twice.
+  // Never-checked first, then oldest last_checked_at.
   const queue = [...feed].sort((a, b) => {
     const ta = state.get(a.anilist_id) ?? 0
     const tb = state.get(b.anilist_id) ?? 0
@@ -219,39 +143,38 @@ async function runCheck(batch: number, quorumOverride: number | null, budgetMs: 
   const picked = queue.slice(0, batch)
   const neverChecked = feed.filter((f) => !state.has(f.anilist_id)).length
 
+  const entries: { anilist_id: number; episode_number: number }[] = []
+  const checked: { anilistId: number; missingCount: number }[] = []
   const results: any[] = []
-  let totalInserted = 0
-  let stoppedByBudget = false
   let next = 0
 
+  // Just fetches episode numbers, a few anime at a time.
   const worker = async () => {
     while (true) {
-      // Only start an anime if it can still finish inside the budget at worst-case request time.
-      if (Date.now() - started + ANIVEXA_TIMEOUT_MS > budgetMs) {
-        stoppedByBudget = true
-        return
-      }
       const item = picked[next++]
       if (!item) return
       try {
-        const r = await checkOne(item, quorumOverride)
-        totalInserted += r.inserted
-        await stamp(item.anilist_id, r.missing.length, null)
+        const have = new Set(item.episode_numbers)
+        const numbers = await fetchEpisodeNumbers(item.anilist_id)
+        // Fill gaps and everything above, but never below the lowest episode OtakuNaija has.
+        // No episodes yet = take everything.
+        const lowerBound = have.size > 0 ? Math.min(...have) : 1
+        const missing = [...numbers]
+          .filter((n) => n >= lowerBound && !have.has(n))
+          .sort((a, b) => a - b)
+        for (const episode_number of missing) {
+          entries.push({ anilist_id: item.anilist_id, episode_number })
+        }
+        checked.push({ anilistId: item.anilist_id, missingCount: missing.length })
         results.push({
           anilistId: item.anilist_id,
           title: item.title,
-          haveLatest: item.latest_episode,
           haveCount: item.episode_count,
-          missingCount: r.missing.length,
-          missingSample: r.missing.slice(0, 20),
-          providersWithData: r.providersWithData,
-          minAgree: r.minAgree,
-          inserted: r.inserted,
-          alreadyKnown: r.alreadyKnown,
+          missingCount: missing.length,
+          missingSample: missing.slice(0, 20),
         })
       } catch (e) {
         const message = getErrorMessage(e)
-        // Stamp anyway so one broken anime can't block the rotation; it is retried next loop.
         await stamp(item.anilist_id, 0, message).catch(() => {})
         results.push({ anilistId: item.anilist_id, title: item.title, error: message })
       }
@@ -259,26 +182,28 @@ async function runCheck(batch: number, quorumOverride: number | null, budgetMs: 
   }
   await Promise.all(Array.from({ length: CONCURRENCY }, worker))
 
+  // Insert once, same as discovery.
+  const deduped = deduplicateEntries(entries)
+  const existingKeys = await findExistingPendingSyncEntries(deduped)
+  const inserted = await insertPendingSync(deduped)
+
+  // Stamp only after the insert succeeded, so a failed insert is retried next run.
+  await Promise.all(checked.map((c) => stamp(c.anilistId, c.missingCount, null).catch(() => {})))
+
   return {
     feedSize: feed.length,
     neverChecked,
     batchRequested: batch,
     checked: results.length,
-    pendingSyncInserted: totalInserted,
-    stoppedByBudget,
+    missingFound: deduped.length,
+    alreadyKnown: deduped.filter((e) => existingKeys.has(`\( {e.anilist_id}- \){e.episode_number}`)).length,
+    pendingSyncInserted: inserted,
     tookMs: Date.now() - started,
     results,
   }
 }
 
 // ---------- Route ----------
-//
-// Two run modes:
-//   1) Default (cron):    responds 202 immediately, then keeps working in the background
-//                         via Next's after(). The Vercel function stays alive up to
-//                         ASYNC_BUDGET_MS. cron-job.org's 30s cutoff won't kill it.
-//   2) ?wait=1 (manual):  runs synchronously inside the request and returns the full
-//                         results as JSON. Use this from Termux for testing.
 
 export async function GET(request: Request) {
   const secret = process.env.EPISODE_CHECK_SECRET
@@ -288,22 +213,20 @@ export async function GET(request: Request) {
 
   const params = new URL(request.url).searchParams
   const batch = Math.min(Math.max(Number(params.get('batch')) || DEFAULT_BATCH, 1), MAX_BATCH)
-  const quorumParam = Number(params.get('quorum'))
-  const quorumOverride = quorumParam >= 1 ? quorumParam : null
 
-  // Mode 2: synchronous, full results. For manual testing (e.g. Termux).
+  // Manual: run inside the request and return full results.
   if (params.get('wait') === '1') {
     try {
-      return Response.json(await runCheck(batch, quorumOverride, SYNC_BUDGET_MS))
+      return Response.json(await runCheck(batch))
     } catch (error) {
       return jsonError(getErrorMessage(error))
     }
   }
 
-  // Mode 1: reply 202 right away, keep working in the background.
+  // Cron: reply 202 right away, keep working in the background.
   after(async () => {
     try {
-      const r = await runCheck(batch, quorumOverride, ASYNC_BUDGET_MS)
+      const r = await runCheck(batch)
       const errors = r.results
         .filter((x: any) => x.error)
         .map((x: any) => ({ id: x.anilistId, title: x.title, error: x.error }))
@@ -311,8 +234,8 @@ export async function GET(request: Request) {
         'episode-check',
         JSON.stringify({
           checked: r.checked,
+          missingFound: r.missingFound,
           inserted: r.pendingSyncInserted,
-          stoppedByBudget: r.stoppedByBudget,
           tookMs: r.tookMs,
           errorCount: errors.length,
           errors,

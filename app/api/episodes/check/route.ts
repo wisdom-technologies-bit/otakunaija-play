@@ -120,7 +120,7 @@ async function fetchEpisodeNumbers(anilistId: number): Promise<Set<number>> {
     for (const list of [val.episodes?.sub, val.episodes?.dub]) {
       if (!Array.isArray(list)) continue
       for (const e of list) {
-        the n = Number(e?.number)
+        const n = Number(e?.number)
         if (Number.isInteger(n) && n >= 1) numbers.add(n)
       }
     }

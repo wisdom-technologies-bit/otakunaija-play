@@ -13,9 +13,9 @@ const PROVIDERS = [
   'aniwaves', 'senshi', 'kaa', 'animedunya', 'animeonsen', 'anipm', 'anibd',
 ] as const
 
-const BATCH_SIZE = 10
-const TIME_BUDGET_MS = 50_000
-const ANIVEXA_TIMEOUT_MS = 15_000
+const BATCH_SIZE = 6
+const TIME_BUDGET_MS = 55_000
+const ANIVEXA_TIMEOUT_MS = 25_000
 const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000
 
 function retryDelayMs(attempts: number) {

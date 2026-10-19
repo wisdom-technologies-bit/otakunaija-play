@@ -54,6 +54,8 @@ type StreamEntry = {
   subtitles?: Array<{ url?: string; [key: string]: unknown }>
   isActive?: boolean
   priority?: number
+  intro?: TimeRange | null
+  outro?: TimeRange | null
 }
 
 type TimeRange = { start: number; end: number }
@@ -76,6 +78,8 @@ type NormalizedStream = {
   server: string | null
   headers: Record<string, unknown>
   subtitles: Array<{ url?: string; [key: string]: unknown }>
+  intro: TimeRange | null
+  outro: TimeRange | null
 }
 
 type EpisodeRow = {
@@ -182,6 +186,8 @@ function qualify(body: WatchResponse | null, requireSubtitle: boolean, providerN
     server: winner.server ?? null,
     headers,
     subtitles: winner.subtitles ?? [],
+    intro: winner.intro ?? null,
+    outro: winner.outro ?? null,
   }
 }
 
@@ -310,7 +316,12 @@ async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, ex
         const usable = await probeStream(stream)
         trace?.push(`${provider}: fetch ${fetchMs}ms, ${stream.server ?? 'default'} (${stream.type}), probe ${usable ? 'ok' : 'FAILED'} at ${Date.now() - started}ms`)
         if (!usable) return null
-        return { provider, stream, intro: body?.intro ?? null, outro: body?.outro ?? null }
+        return {
+          provider,
+          stream,
+          intro: stream.intro,
+          outro: stream.outro,
+        }
       })()
         .catch(() => null)
         .then((result) => {
@@ -384,7 +395,16 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
           const { error: resyncClearError } = await supabase.from('episodes').update({ needs_resync: false, resync_requested_at: null }).eq('play_id', playId)
           if (resyncClearError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
         }
-        return json(await responseFor(playId, episode.resolved_audio, episode.resolved_provider, stream, cachedResponse?.intro ?? null, cachedResponse?.outro ?? null))
+        return json(
+          await responseFor(
+            playId,
+            episode.resolved_audio,
+            episode.resolved_provider,
+            stream,
+            stream.intro,
+            stream.outro,
+          ),
+        )
       }
     }
   }

@@ -12,7 +12,7 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 240
 
 const OTAKUNAIJA_BASE = process.env.OTAKUNAIJA_BASE_URL ?? 'https://otakunaija.name.ng'
-const ANIVEXA_BASE = process.env.ANIVEXA_BASE_URL ?? 'https://anivexa.otakunaija.name.ng'
+const ANIVEXA_BASE = process.env.ANIVEXA_BASE_URL ?? 'https://anivexa-app.vercel.app'
 
 const DEFAULT_BATCH = 12
 const MAX_BATCH = 25

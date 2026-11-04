@@ -4,7 +4,7 @@ export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 90
 
-const ANIVEXA_BASE_URL = 'https://anivexa-app.vercel.app'
+const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
 const ANIVEXA_TIMEOUT_MS = 40_000
 const BATCH_SIZE = 30
 const START_BUDGET_MS = 45_000

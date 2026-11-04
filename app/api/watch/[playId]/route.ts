@@ -5,7 +5,7 @@ export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 240
 
-const ANIVEXA_BASE_URL = 'https://anivexa-app.vercel.app'
+const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
 const REQUEST_TIMEOUT_MS = 12_000
 const FIRST_RESULT_GRACE_MS = 2_500
 const EPISODE_LOOKUP_TIMEOUT_MS = 8_000

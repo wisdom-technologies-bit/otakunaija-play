@@ -95,8 +95,13 @@ New:
 
 ### Cron schedule
 
-Existing jobs in `vercel.json` stay exactly as they are (`/api/discovery/run`
-hourly slots, plus whatever runs sync/export/resync). Add:
+`vercel.json` already declares 30 cron entries, all `/api/discovery/run?slot=N`.
+Those are untouched, and the three new entries were deliberately **not** added to
+that file: this change only documents them, so they go into whatever scheduler
+you already use (Vercel, cron-job.org, GitHub Actions) without changing how the
+existing slots run. Note that `/api/sync/process`, `/api/export/run` and
+`/api/resync/run` are not in `vercel.json` either, so they are triggered
+somewhere else and that trigger keeps working as today.
 
 | Route | Schedule | Why |
 | --- | --- | --- |

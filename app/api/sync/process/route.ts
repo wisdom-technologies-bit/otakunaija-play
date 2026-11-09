@@ -1,5 +1,6 @@
 
 import { createAdminClient } from '@/lib/supabase/admin'
+import { changedAnimeFields, mergeAnimeMetadata } from '@/lib/upcoming'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -223,6 +224,7 @@ export async function GET() {
   let rowsFailed = 0
   let rowsRetrying = 0
   let rowsCompleted = 0
+  let animePromoted = 0
   let rowsSkippedByBudget = 0
 
   const { data: processingRows, error: recoveryError } = await supabase
@@ -351,23 +353,37 @@ export async function GET() {
 
       const { data: existingAnime, error: existingAnimeError } = await supabase
         .from('anime')
-        .select('anilist_id, format')
+        .select(
+          'anilist_id, is_placeholder, status_synced_to_otaku, mal_id, title, description, cover_url, poster_url, banner_url, genres, release_year, studio, format, start_date, start_year, start_month, start_day, season, season_year, popularity, trailer_site, trailer_id, episodes_total, duration_minutes, source',
+        )
         .eq('anilist_id', row.anilist_id)
         .maybeSingle()
 
       if (existingAnimeError) throw existingAnimeError
 
-      if (
-        existingAnime &&
-        animeFormat &&
-        existingAnime.format?.toUpperCase() !== animeFormat
-      ) {
-        const { error } = await supabase
-          .from('anime')
-          .update({ format: animeFormat })
-          .eq('anilist_id', row.anilist_id)
+      if (existingAnime) {
+        // Merge, never blank: an upcoming placeholder already carries good
+        // AniList metadata, and the values we have here may be missing (a
+        // failed Jikan lookup, a provider payload without a format). Only fill
+        // gaps, so a null can never wipe a title, cover or description.
+        const merged = mergeAnimeMetadata(existingAnime, {
+          mal_id: malId,
+          title: animeTitle || null,
+          format: animeFormat ?? null,
+        })
+        const changed = changedAnimeFields(existingAnime, merged)
 
-        if (error) throw error
+        if (changed.length) {
+          const patch: Record<string, unknown> = { updated_at: new Date().toISOString() }
+          for (const field of changed) patch[field] = merged[field] ?? null
+
+          const { error } = await supabase
+            .from('anime')
+            .update(patch)
+            .eq('anilist_id', row.anilist_id)
+
+          if (error) throw error
+        }
       }
 
       if (!existingAnime) {
@@ -450,6 +466,27 @@ export async function GET() {
 
       if (episodeError) throw episodeError
 
+      // Promotion: the first real episode turns a metadata-only placeholder
+      // into an airing anime. This is the single place episodes are created,
+      // so it covers the airing sweep, the catalog sweep, seasonal discovery
+      // and manual imports alike.
+      if (existingAnime?.is_placeholder === true) {
+        const now = new Date().toISOString()
+        const { error: promoteError } = await supabase
+          .from('anime')
+          .update({
+            is_placeholder: false,
+            discovery_source: 'airing',
+            status: 'RELEASING',
+            anilist_synced_at: now,
+            updated_at: now,
+          })
+          .eq('anilist_id', row.anilist_id)
+
+        if (promoteError) throw promoteError
+        animePromoted += 1
+      }
+
       const { error: doneError } = await supabase
         .from('pending_sync')
         .update({
@@ -477,6 +514,7 @@ export async function GET() {
   return Response.json({
     rowsSelected: eligibleRows.length,
     rowsCompleted,
+    animePromoted,
     rowsFailed,
     rowsRetrying,
     rowsSkippedByBudget,

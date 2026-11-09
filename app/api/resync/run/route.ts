@@ -103,7 +103,10 @@ export async function GET(request: Request) {
     const { data: airingRows, error: airingError } = await supabase
       .from('anime')
       .select('anilist_id, last_resynced_at')
-      .eq('status', 'Currently Airing')
+      // 'Currently Airing' is the Jikan vocabulary the sync path stores;
+      // 'RELEASING' is what a promoted upcoming placeholder gets, so both must
+      // count as airing here.
+      .in('status', ['Currently Airing', 'RELEASING'])
       .order('last_resynced_at', { ascending: true, nullsFirst: true })
       .limit(remaining)
     if (airingError) return Response.json({ error: airingError.message }, { status: 500 })

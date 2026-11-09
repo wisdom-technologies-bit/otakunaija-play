@@ -1,4 +1,6 @@
 import { createAdminClient } from '@/lib/supabase/admin'
+import { isRetryEligible, postOtaku, shortError, wait } from '@/lib/otaku'
+import { buildOtakuAnimePayload, mapStoredStatus } from '@/lib/upcoming'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -8,20 +10,7 @@ const ANIVEXA_BASE_URL = 'https://anivexa.otakunaija.name.ng'
 const JIKAN_BASE_URL = 'https://api.jikan.moe/v4'
 const BATCH_SIZE = 10
 const TIME_BUDGET_MS = 50_000
-const REQUEST_TIMEOUT_MS = 10_000
-const MAX_RETRY_DELAY_MS = 6 * 60 * 60 * 1000
-
 let lastJikanCallAt = 0
-
-function retryDelayMs(attempts: number) {
-  const exponential = Math.min(MAX_RETRY_DELAY_MS, 30_000 * 2 ** Math.min(attempts, 8))
-  return Math.round(exponential * (0.8 + Math.random() * 0.4))
-}
-
-function isRetryEligible(updatedAt: string | null, attempts: number) {
-  if (!updatedAt) return true
-  return Date.now() - new Date(updatedAt).getTime() >= retryDelayMs(attempts)
-}
 
 type AnimeRow = {
   anilist_id: number
@@ -40,6 +29,7 @@ type AnimeRow = {
   otaku_video_id: number | null
   exported_to_otaku: boolean
   export_attempts: number
+  status_synced_to_otaku: string | null
 }
 
 type EpisodeRow = {
@@ -69,46 +59,6 @@ function decodeHtml(value: string | null | undefined): string | null {
     }
     return named[entity.toLowerCase()] ?? match
   })
-}
-
-function shortError(error: unknown): string {
-  return (error instanceof Error ? error.message : String(error)).slice(0, 500)
-}
-
-function wait(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-async function postOtaku(path: string, body: Record<string, unknown>, retryCount = 0) {
-  const baseUrl = process.env.OTAKUNAIJA_API_URL
-  const apiKey = process.env.OTAKUNAIJA_API_KEY
-  if (!baseUrl || !apiKey) throw new Error('OtakuNaija API credentials are not configured')
-
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
-  try {
-    const response = await fetch(`${baseUrl.replace(/\/$/, '')}${path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-play-api-key': apiKey },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-      cache: 'no-store',
-    })
-    let payload: Record<string, unknown> = {}
-    try { payload = await response.json() as Record<string, unknown> } catch { /* handled as an invalid response */ }
-    if ((response.status === 429 || response.status >= 500) && retryCount < 2) {
-      const retryAfter = Number(response.headers.get('retry-after'))
-      const delay = Number.isFinite(retryAfter) ? Math.min(60_000, retryAfter * 1000) : 1_000 + Math.random() * 2_000
-      await wait(delay)
-      return postOtaku(path, body, retryCount + 1)
-    }
-    return { response, payload }
-  } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') throw new Error('OtakuNaija request timed out')
-    throw error
-  } finally {
-    clearTimeout(timeout)
-  }
 }
 
 async function fetchJikan(malId: number) {
@@ -148,6 +98,8 @@ export async function GET() {
   if (!eligibleRows.length) return Response.json({ processed: 0, message: 'no retry-eligible exports' })
 
   let episodesExported = 0
+  let animeStatusesFlipped = 0
+  let animeStatusFlipFailed = 0
   let episodesBlockedByAnime = 0
   let episodesFailed = 0
   let episodesRetrying = 0
@@ -156,7 +108,7 @@ export async function GET() {
     if (Date.now() - startedAt >= TIME_BUDGET_MS) break
     const { data: anime, error: animeLookupError } = await supabase
   .from('anime')
-  .select('anilist_id, mal_id, title, description, cover_url, genres, status, release_year, studio, poster_url, banner_url, format, otaku_anime_id, otaku_video_id, exported_to_otaku, export_attempts')
+  .select('anilist_id, mal_id, title, description, cover_url, genres, status, release_year, studio, poster_url, banner_url, format, otaku_anime_id, otaku_video_id, exported_to_otaku, export_attempts, status_synced_to_otaku')
   .eq('anilist_id', episode.anilist_id)
   .maybeSingle()
     if (animeLookupError || !anime) {
@@ -257,12 +209,45 @@ export async function GET() {
           bannerUrl: animeRow.banner_url,
         })
         if (![200, 201].includes(result.response.status) || typeof result.payload.seriesId !== 'number') throw new Error(`Anime export HTTP ${result.response.status}`)
-        const { error: saveAnimeError } = await supabase.from('anime').update({ otaku_anime_id: result.payload.seriesId, exported_to_otaku: true, last_export_error: null }).eq('anilist_id', animeRow.anilist_id)
+        const syncedStatus = mapStoredStatus(animeRow.status)
+        const { error: saveAnimeError } = await supabase.from('anime').update({ otaku_anime_id: result.payload.seriesId, exported_to_otaku: true, status_synced_to_otaku: syncedStatus, last_export_error: null }).eq('anilist_id', animeRow.anilist_id)
         if (saveAnimeError) throw saveAnimeError
+        animeRow.otaku_anime_id = result.payload.seriesId
+        animeRow.status_synced_to_otaku = syncedStatus
       } catch (error) {
         await updateAttempt(supabase, 'anime', animeRow.anilist_id, animeRow.export_attempts + 1, shortError(error))
         episodesBlockedByAnime += 1
         continue
+      }
+    }
+
+    // An anime that reached OtakuNaija as an upcoming placeholder flips to
+    // ongoing as soon as it has a real episode to export.
+    if (animeRow.otaku_anime_id != null && animeRow.status_synced_to_otaku === 'upcoming') {
+      try {
+        const decodedRow = {
+          ...animeRow,
+          title: decodeHtml(animeRow.title),
+          description: decodeHtml(animeRow.description),
+        }
+        const statusResult = await postOtaku(
+          '/api/play/anime',
+          buildOtakuAnimePayload(decodedRow, { statusOverride: 'ongoing', isPlaceholder: false }) as unknown as Record<string, unknown>,
+        )
+        if (![200, 201].includes(statusResult.response.status)) {
+          throw new Error(`Anime status update HTTP ${statusResult.response.status}`)
+        }
+        const { error: statusSaveError } = await supabase
+          .from('anime')
+          .update({ status_synced_to_otaku: 'ongoing' })
+          .eq('anilist_id', animeRow.anilist_id)
+        if (statusSaveError) throw statusSaveError
+        animeRow.status_synced_to_otaku = 'ongoing'
+        animeStatusesFlipped += 1
+      } catch (error) {
+        // Never block the episode: the flip is retried while the status stays 'upcoming'.
+        console.error('[export] placeholder status update failed', animeRow.anilist_id, shortError(error))
+        animeStatusFlipFailed += 1
       }
     }
 
@@ -292,6 +277,6 @@ export async function GET() {
     }
   }
 
-  return Response.json({ episodesSelected: eligibleRows.length, episodesExported, episodesBlockedByAnime, episodesFailed, episodesRetrying })
+  return Response.json({ episodesSelected: eligibleRows.length, episodesExported, episodesBlockedByAnime, episodesFailed, episodesRetrying, animeStatusesFlipped, animeStatusFlipFailed })
 }
 

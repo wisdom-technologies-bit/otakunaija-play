@@ -1,4 +1,4 @@
-import { corsHeaders, proxyJson, signProxyUrl, verifyProxySignature, withDefaultUserAgent } from '@/lib/proxy-signing'
+import { corsHeaders, proxyJson, rewriteManifest, verifyProxySignature, withDefaultUserAgent } from '@/lib/proxy-signing'
 
 export const runtime = 'edge'
 
@@ -17,37 +17,9 @@ const timeoutFetch = async (url: string, headers: Record<string, string>) => {
   }
 }
 
-async function rewriteManifest(body: string, targetUrl: string, headers: Record<string, string>) {
-  const baseUrl = targetUrl.slice(0, targetUrl.lastIndexOf('/') + 1)
-  const resolve = (value: string) => /^https?:/i.test(value) ? value : new URL(value, baseUrl).toString()
-  const lines = body.split(/\r?\n/)
-  const rewritten: string[] = []
-
-  for (const line of lines) {
-    const trimmed = line.trim()
-    if (!trimmed || (trimmed.startsWith('#') && !/^#EXT-X-(KEY|MAP)/.test(trimmed))) {
-      rewritten.push(line)
-      continue
-    }
-
-    if (/^#EXT-X-(KEY|MAP)/.test(trimmed)) {
-      const match = line.match(/URI="([^"]+)"/)
-      if (!match) {
-        rewritten.push(line)
-        continue
-      }
-      const proxyUrl = await signProxyUrl(resolve(match[1]), headers, '/api/proxy/segment')
-      rewritten.push(line.replace(match[0], `URI="${proxyUrl}"`))
-      continue
-    }
-
-    const absolute = resolve(trimmed)
-    const route = absolute.toLowerCase().includes('.m3u8') ? '/api/proxy/manifest' : '/api/proxy/segment'
-    rewritten.push(await signProxyUrl(absolute, headers, route))
-  }
-
-  return rewritten.join('\n')
-}
+// The rewrite lives in lib/proxy-signing.ts so this route and the helper cannot
+// drift. It honours DIRECT_SEGMENT_HOSTS: with the default `none` every media
+// URI is still proxied through /api/proxy/segment, exactly as before.
 
 export function OPTIONS() { return new Response(null, { status: 204, headers: corsHeaders() }) }
 

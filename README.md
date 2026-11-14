@@ -17,7 +17,9 @@ OtakuNaija Play is the service layer that powers episode discovery, metadata enr
 - `app/api/discovery/run` — finds newly airing episodes.
 - `app/api/sync/process` — turns queued episodes into playable records.
 - `app/api/watch/[playId]` — resolves and caches working streams.
-- `app/api/proxy/*` — signed media and subtitle proxy endpoints.
+- `app/api/proxy/*` — signed media and subtitle proxy endpoints (`ani-subtitle` serves the ani-api tracks that need converting).
+- `app/api/admin/ani-status` — ani provider switch, breaker, cache and counters (cron-secret guarded).
+- `lib/ani/*` — the ani-api provider: config, HTTP client (cache, single-flight, breaker, limiter), validation. Node runtime only.
 - `app/api/resync/run` — refreshes provider availability.
 - `app/api/export/run` — exports records to OtakuNaija.
 - `app/api/discovery/upcoming` — AniList `NOT_YET_RELEASED` sweep into placeholders (no episodes).
@@ -30,6 +32,7 @@ OtakuNaija Play is the service layer that powers episode discovery, metadata enr
 - `lib/placeholder.ts` — placeholder export bookkeeping.
 - `lib/auth.ts` — cron/write-route authorization.
 - `docs/sql/upcoming-discovery.sql` — idempotent schema change (run manually).
+- `docs/ani-provider.md` — the ani provider: flags, rollout, fallbacks, direct segments.
 
 ## Local development
 

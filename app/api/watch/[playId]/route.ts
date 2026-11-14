@@ -1,5 +1,7 @@
 import { createAdminClient } from '@/lib/supabase/admin'
 import { signProxyUrl } from '@/lib/proxy-signing'
+import { resolveMalId, type MinimalSupabase } from '@/lib/ani/mal'
+import { tryAni } from '@/lib/ani/resolve'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -28,6 +30,75 @@ const SUBTITLE_LABEL_TO_SRCLANG: Record<string, string> = {
   russian: 'ru',
   thai: 'th',
   vietnamese: 'vi',
+}
+
+// Providers word their labels loosely: "Portuguese - Brazil", "Spanish (Latin
+// America)", "English SDH". The language is the leading word, the rest is the
+// variant, so a label the exact map misses still maps to a sensible code. This
+// only fills a gap: a track that already states its own srclang keeps it.
+const SUBTITLE_LEADING_WORD_TO_SRCLANG: Record<string, string> = {
+  english: 'en',
+  japanese: 'ja',
+  chinese: 'zh',
+  mandarin: 'zh',
+  cantonese: 'zh',
+  korean: 'ko',
+  arabic: 'ar',
+  german: 'de',
+  spanish: 'es',
+  latino: 'es',
+  french: 'fr',
+  indonesian: 'id',
+  italian: 'it',
+  malay: 'ms',
+  polish: 'pl',
+  portuguese: 'pt',
+  russian: 'ru',
+  thai: 'th',
+  vietnamese: 'vi',
+  turkish: 'tr',
+  dutch: 'nl',
+  hebrew: 'he',
+  greek: 'el',
+  bulgarian: 'bg',
+  danish: 'da',
+  finnish: 'fi',
+  norwegian: 'no',
+  swedish: 'sv',
+  czech: 'cs',
+  hungarian: 'hu',
+  romanian: 'ro',
+  ukrainian: 'uk',
+  hindi: 'hi',
+  bengali: 'bn',
+  tamil: 'ta',
+  telugu: 'te',
+  filipino: 'fil',
+  tagalog: 'tl',
+  persian: 'fa',
+  urdu: 'ur',
+  croatian: 'hr',
+  serbian: 'sr',
+  catalan: 'ca',
+  swahili: 'sw',
+  afrikaans: 'af',
+}
+
+function srclangForLabel(rawLabel: string | null, current: unknown): string | undefined {
+  if (!rawLabel) return undefined
+  const label = rawLabel.trim().toLowerCase().replace(/\s+/g, ' ')
+  if (!label) return undefined
+  const exact = SUBTITLE_LABEL_TO_SRCLANG[label]
+  if (exact) return exact
+  if (typeof current === 'string' && current.length > 0) return undefined
+  const leading = label.split(/[\s(\-\u2013\u2014/.,;|\[]/)[0]
+  const base = SUBTITLE_LEADING_WORD_TO_SRCLANG[leading]
+  if (!base) return undefined
+  if (base === 'zh') {
+    if (label.includes('simplified')) return 'zh-Hans'
+    if (label.includes('traditional')) return 'zh-Hant'
+  }
+  return base
 }
 
 const KNOWN_PROVIDERS = new Set([
@@ -85,6 +156,7 @@ type NormalizedStream = {
 type EpisodeRow = {
   play_id: string
   anilist_id: number
+  mal_id: number | null
   episode_number: number
   sub_providers: ProviderEntry[] | null
   dub_providers: ProviderEntry[] | null
@@ -199,13 +271,28 @@ function ageMs(value: string) {
   return Date.now() - new Date(value).getTime()
 }
 
-async function responseFor(playId: string, audio: 'sub' | 'dub', provider: string, stream: NormalizedStream, intro: TimeRange | null = null, outro: TimeRange | null = null) {
+async function responseFor(
+  playId: string,
+  audio: 'sub' | 'dub',
+  provider: string,
+  stream: NormalizedStream,
+  intro: TimeRange | null = null,
+  outro: TimeRange | null = null,
+  /**
+   * Per-subtitle path already signed elsewhere (the ani provider signs the
+   * tracks it has to convert itself). A null entry keeps the usual behaviour:
+   * sign the track's own url through /api/proxy/subtitle.
+   */
+  subtitlePaths: Array<string | null> = [],
+) {
   const headers = stream.headers as Record<string, string>
   const proxied = Object.keys(headers).length > 0
-  const subtitles = await Promise.all(stream.subtitles.map(async (subtitle) => {
-    const label = typeof subtitle.label === 'string' ? subtitle.label.trim().toLowerCase() : null
-    const correctedSrclang = label ? SUBTITLE_LABEL_TO_SRCLANG[label] : undefined
+  const subtitles = await Promise.all(stream.subtitles.map(async (subtitle, index) => {
+    const label = typeof subtitle.label === 'string' ? subtitle.label : null
+    const correctedSrclang = srclangForLabel(label, subtitle.srclang)
     const correctedSubtitle = correctedSrclang ? { ...subtitle, srclang: correctedSrclang } : subtitle
+    const signed = subtitlePaths[index]
+    if (typeof signed === 'string' && signed.length > 0) return { ...correctedSubtitle, url: signed }
     if (typeof subtitle.url !== 'string' || subtitle.url.length === 0) return correctedSubtitle
     return {
       ...correctedSubtitle,
@@ -341,7 +428,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   const supabase = createAdminClient()
   const { data: episode, error } = await supabase
     .from('episodes')
-    .select('play_id, anilist_id, episode_number, sub_providers, dub_providers, resolved_provider, resolved_audio, resolved_at, needs_resync')
+    .select('play_id, anilist_id, mal_id, episode_number, sub_providers, dub_providers, resolved_provider, resolved_audio, resolved_at, needs_resync')
     .eq('play_id', playId)
     .maybeSingle<EpisodeRow>()
 
@@ -351,6 +438,62 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   const excludeParam = new URL(_request.url).searchParams.get('exclude') ?? ''
   const excluded = new Set(excludeParam.split(',').map((value) => value.trim()).filter(Boolean))
   const hasExclusions = excluded.size > 0
+
+  const debug = new URL(_request.url).searchParams.get('debug') === '1'
+  const trace: string[] = []
+
+  // Our own ani-api is tried FIRST, before the resolved-provider cache and the
+  // Anivexa race. Everything it needs is gated inside `tryAni`: flag, base URL,
+  // key, rollout percentage, the `ani:` exclusion the player sends back after a
+  // playback error, and the MAL id (looked up only once every cheap gate has
+  // passed). Any miss, failure or invalid payload falls through to the code
+  // below exactly as it ran before this provider existed.
+  const ani = await tryAni({
+    anilistId: episode.anilist_id,
+    episodeNumber: episode.episode_number,
+    malId: episode.mal_id ?? null,
+    audio: 'sub',
+    excluded,
+    probe: (streamUrl, headers) => probeStream({
+      streamUrl,
+      type: 'hls',
+      server: null,
+      headers,
+      subtitles: [],
+      intro: null,
+      outro: null,
+    }),
+    lookupMalId: () => resolveMalId({
+      anilistId: episode.anilist_id,
+      episodeMalId: episode.mal_id ?? null,
+      supabase: supabase as unknown as MinimalSupabase,
+      anivexaBaseUrl: ANIVEXA_BASE_URL,
+    }),
+  })
+
+  if (ani.status === 'ok') {
+    const payload = await responseFor(
+      playId,
+      'sub',
+      'ani',
+      {
+        streamUrl: ani.stream.streamUrl,
+        type: ani.stream.type,
+        server: ani.stream.server,
+        headers: ani.stream.headers,
+        subtitles: ani.stream.subtitles,
+        intro: null,
+        outro: null,
+      },
+      null,
+      null,
+      ani.stream.subtitlePaths,
+    )
+    // Deliberately no resolved_provider / resolved_audio / resolved_at write and
+    // no needs_resync change: Anivexa's provider health must stay untouched.
+    return json(debug ? { ...payload, trace } : payload)
+  }
+  trace.push(`ani: ${ani.status} ${ani.reason} ${ani.ms}ms`)
 
   let subProviders = episode.sub_providers ?? []
   let dubProviders = episode.dub_providers ?? []
@@ -408,9 +551,6 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
       }
     }
   }
-
-  const debug = new URL(_request.url).searchParams.get('debug') === '1'
-  const trace: string[] = []
 
   let subWinner = subProviders.length > 0 ? await findWinner(subProviders, true, excluded, trace) : null
   let dubWinner = !subWinner && dubProviders.length > 0 ? await findWinner(dubProviders, false, excluded, trace) : null

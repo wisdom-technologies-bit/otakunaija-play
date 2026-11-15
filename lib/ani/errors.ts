@@ -41,6 +41,7 @@ export type AniErrorCode =
   | 'ANI_NO_SUBTITLE'
   | 'ANI_HOST_NOT_ALLOWED'
   | 'ANI_PROBE_FAILED'
+  | 'ANI_DUB_SAME_AS_SUB'
   | 'ANI_UNKNOWN'
 
 export class AniRequestError extends Error {
@@ -75,6 +76,9 @@ export const SHORT_NEGATIVE_CODES: ReadonlySet<AniErrorCode> = new Set<AniErrorC
   'ANI_TIMEOUT',
   'ANI_NETWORK',
   'ANI_BAD_JSON',
+  // The provider answered the dub request with the sub stream. Remembering it
+  // for a minute keeps every viewer from paying for the same comparison.
+  'ANI_DUB_SAME_AS_SUB',
 ])
 
 export function isAniError(value: unknown): value is AniRequestError {

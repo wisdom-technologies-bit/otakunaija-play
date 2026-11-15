@@ -2,6 +2,7 @@ import { createAdminClient } from '@/lib/supabase/admin'
 import { signProxyUrl } from '@/lib/proxy-signing'
 import { resolveMalId, type MinimalSupabase } from '@/lib/ani/mal'
 import { tryAni } from '@/lib/ani/resolve'
+import { srclangForLabel } from '@/lib/subtitle-language'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -12,94 +13,6 @@ const REQUEST_TIMEOUT_MS = 12_000
 const FIRST_RESULT_GRACE_MS = 2_500
 const EPISODE_LOOKUP_TIMEOUT_MS = 8_000
 const STREAM_PROBE_TIMEOUT_MS = 4_000
-
-const SUBTITLE_LABEL_TO_SRCLANG: Record<string, string> = {
-  english: 'en',
-  'chinese (simplified)': 'zh-Hans',
-  'chinese (traditional)': 'zh-Hant',
-  korean: 'ko',
-  arabic: 'ar',
-  german: 'de',
-  spanish: 'es',
-  french: 'fr',
-  indonesian: 'id',
-  italian: 'it',
-  malay: 'ms',
-  polish: 'pl',
-  portuguese: 'pt',
-  russian: 'ru',
-  thai: 'th',
-  vietnamese: 'vi',
-}
-
-// Providers word their labels loosely: "Portuguese - Brazil", "Spanish (Latin
-// America)", "English SDH". The language is the leading word, the rest is the
-// variant, so a label the exact map misses still maps to a sensible code. This
-// only fills a gap: a track that already states its own srclang keeps it.
-const SUBTITLE_LEADING_WORD_TO_SRCLANG: Record<string, string> = {
-  english: 'en',
-  japanese: 'ja',
-  chinese: 'zh',
-  mandarin: 'zh',
-  cantonese: 'zh',
-  korean: 'ko',
-  arabic: 'ar',
-  german: 'de',
-  spanish: 'es',
-  latino: 'es',
-  french: 'fr',
-  indonesian: 'id',
-  italian: 'it',
-  malay: 'ms',
-  polish: 'pl',
-  portuguese: 'pt',
-  russian: 'ru',
-  thai: 'th',
-  vietnamese: 'vi',
-  turkish: 'tr',
-  dutch: 'nl',
-  hebrew: 'he',
-  greek: 'el',
-  bulgarian: 'bg',
-  danish: 'da',
-  finnish: 'fi',
-  norwegian: 'no',
-  swedish: 'sv',
-  czech: 'cs',
-  hungarian: 'hu',
-  romanian: 'ro',
-  ukrainian: 'uk',
-  hindi: 'hi',
-  bengali: 'bn',
-  tamil: 'ta',
-  telugu: 'te',
-  filipino: 'fil',
-  tagalog: 'tl',
-  persian: 'fa',
-  urdu: 'ur',
-  croatian: 'hr',
-  serbian: 'sr',
-  catalan: 'ca',
-  swahili: 'sw',
-  afrikaans: 'af',
-}
-
-function srclangForLabel(rawLabel: string | null, current: unknown): string | undefined {
-  if (!rawLabel) return undefined
-  const label = rawLabel.trim().toLowerCase().replace(/\s+/g, ' ')
-  if (!label) return undefined
-  const exact = SUBTITLE_LABEL_TO_SRCLANG[label]
-  if (exact) return exact
-  if (typeof current === 'string' && current.length > 0) return undefined
-  const leading = label.split(/[\s(\-\u2013\u2014/.,;|\[]/)[0]
-  const base = SUBTITLE_LEADING_WORD_TO_SRCLANG[leading]
-  if (!base) return undefined
-  if (base === 'zh') {
-    if (label.includes('simplified')) return 'zh-Hans'
-    if (label.includes('traditional')) return 'zh-Hant'
-  }
-  return base
-}
 
 const KNOWN_PROVIDERS = new Set([
   'mkissa', 'reanime', 'anikoto', 'animegg', 'animenosub', 'anizone',
@@ -482,11 +395,14 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
         server: ani.stream.server,
         headers: ani.stream.headers,
         subtitles: ani.stream.subtitles,
-        intro: null,
-        outro: null,
+        // AniKoto sends real `[start, end]` markers; they are normalised and
+        // shaped in lib/ani/resolve.ts and land in the same two fields Anivexa
+        // already fills, so the player needs no change.
+        intro: ani.stream.intro,
+        outro: ani.stream.outro,
       },
-      null,
-      null,
+      ani.stream.intro,
+      ani.stream.outro,
       ani.stream.subtitlePaths,
     )
     // Deliberately no resolved_provider / resolved_audio / resolved_at write and

@@ -53,10 +53,20 @@ async function check({ malId, name }) {
   const variants = Array.isArray(body?.variants) ? body.variants : []
   const subtitles = Array.isArray(body?.subtitles) ? body.subtitles : []
 
+  const headers = body?.headers_required ?? {}
+  const markers = (value) => Array.isArray(value) && value.length === 2
+    ? `[${value[0]}, ${value[1]}]${Number(value[1]) > Number(value[0]) ? '' : ' (unknown)'}`
+    : 'n/a'
+
   console.log(`\nMAL ${malId} (${name}): ${ms}ms`)
+  console.log(`  provider: ${body?.provider ?? 'n/a'}`)
   console.log(`  stream_verified: ${mal.stream_verified === true}`)
   console.log(`  mal: ${mal.mal_id}/${mal.mal_episode} (${mal.verification ?? 'n/a'})`)
   console.log(`  stream_type: ${body?.stream_type ?? 'n/a'}`)
+  console.log(`  master_host: ${masterHost(body?.master_url)}`)
+  console.log(`  referers: master=${headers?.master_playlist?.Referer ?? 'n/a'} subtitles=${headers?.subtitles?.Referer ?? 'n/a'} segments=${JSON.stringify(headers?.segments ?? {})}`)
+  console.log(`  intro: ${markers(body?.intro)}  outro: ${markers(body?.outro)}`)
+  console.log(`  url_lifetime: ${body?.url_lifetime ? JSON.stringify(body.url_lifetime) : 'none (expiry unknown)'}`)
   console.log(`  variants: ${variants.length === 0 ? 'none' : variants.map((v) => `${v.quality}${v.playable ? '' : '*'}`).join(', ')}  (* = not playable)`)
   console.log(`  subtitles (${subtitles.length}):`)
   for (const track of subtitles) {
@@ -65,6 +75,15 @@ async function check({ malId, name }) {
     )
   }
   return mal.stream_verified === true
+}
+
+/** Host only: the full master URL is a signed playlist, the host is the fact. */
+function masterHost(value) {
+  try {
+    return new URL(String(value)).host
+  } catch {
+    return 'n/a'
+  }
 }
 
 let verified = 0

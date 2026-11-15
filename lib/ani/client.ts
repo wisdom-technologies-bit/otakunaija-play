@@ -32,7 +32,17 @@ import {
 } from './errors'
 import type { AniAudio, AniStreamPayload } from './types'
 
+/**
+ * Stream cache ceiling. ZokoAnime publishes `url_lifetime` (observed ~28 min);
+ * AniKoto publishes none at all, so its entry is capped at 10 minutes (see
+ * `cacheTtlMsFor`). Nothing is ever cached beyond 10 minutes today, which is
+ * the number the docs promise.
+ */
 const CACHE_TTL_MS = 10 * 60 * 1000
+/** AniKoto advertises `expiry_known: false`, so never hold it longer than this. */
+const ANIKOTO_CACHE_TTL_MS = 10 * 60 * 1000
+/** Never trust a provider lifetime closer to the edge than this. */
+const MIN_CACHE_TTL_MS = 60 * 1000
 const CACHE_MAX = 500
 const NEGATIVE_LONG_MS = 30 * 60 * 1000
 const NEGATIVE_SHORT_MS = 60 * 1000
@@ -43,7 +53,7 @@ const RATE_WINDOW_MS = 60 * 1000
 const MAX_PAUSE_MS = 5 * 60 * 1000
 const OUTCOME_LOG_MAX = 20
 
-type CacheEntry = { at: number; payload: AniStreamPayload }
+type CacheEntry = { at: number; ttl: number; payload: AniStreamPayload }
 type NegativeEntry = { until: number; code: AniErrorCode }
 export type AniOutcome = {
   at: string
@@ -111,6 +121,23 @@ export function __resetAniState() {
 
 function cacheKey(malId: number, episode: number, audio: AniAudio) {
   return `${malId}:${episode}:${audio}`
+}
+
+/**
+ * How long one resolved payload may be reused.
+ *
+ * AniKoto reports no `url_lifetime` (`expiry_known: false`), so its entry is
+ * capped at 10 minutes and never extended by anything the payload says. A
+ * provider that does publish a lifetime is honoured, but only downwards: a
+ * shorter claim shortens the entry, a longer one cannot beat the ceiling.
+ */
+export function cacheTtlMsFor(payload: AniStreamPayload): number {
+  const provider = typeof payload.provider === 'string' ? payload.provider.trim().toLowerCase() : ''
+  if (provider === 'anikoto') return ANIKOTO_CACHE_TTL_MS
+  const observed = Number(payload.url_lifetime?.observed_valid_for_minutes)
+  if (!Number.isFinite(observed) || observed <= 0) return CACHE_TTL_MS
+  // Two minutes of headroom under the provider's own claim.
+  return Math.max(MIN_CACHE_TTL_MS, Math.min(CACHE_TTL_MS, (observed - 2) * 60 * 1000))
 }
 
 function trim() {
@@ -252,7 +279,7 @@ export async function getAniStream(
 
   if (!options.refresh) {
     const cached = state.cache.get(key)
-    if (cached && now - cached.at < CACHE_TTL_MS) {
+    if (cached && now - cached.at < cached.ttl) {
       state.counters.cacheHits += 1
       // Refresh LRU position.
       state.cache.delete(key)
@@ -295,7 +322,7 @@ export async function getAniStream(
         state.counters.retries += 1
         payload = await attempt(config, url)
       }
-      state.cache.set(key, { at: Date.now(), payload })
+      state.cache.set(key, { at: Date.now(), ttl: cacheTtlMsFor(payload), payload })
       state.negative.delete(key)
       state.counters.ok += 1
       trim()
@@ -326,7 +353,7 @@ export async function getAniStream(
 export function peekAniCache(malId: number, episode: number, audio: AniAudio): AniStreamPayload | null {
   const cached = state.cache.get(cacheKey(malId, episode, audio))
   if (!cached) return null
-  return Date.now() - cached.at < CACHE_TTL_MS ? cached.payload : null
+  return Date.now() - cached.at < cached.ttl ? cached.payload : null
 }
 
 /** Record one attempt for `ani_outcome` console lines and ani-status. */
@@ -378,6 +405,8 @@ export type AniStatus = {
   percent: number
   dubEnabled: boolean
   requireSubtitle: boolean
+  anikotoRequireSubtitle: boolean
+  masterHosts: string[]
   configured: boolean
   breaker: { open: boolean, opensInMs: number, recentFailures: number }
   paused: { paused: boolean, resumesInMs: number }
@@ -398,6 +427,8 @@ export function getAniStatus(env: AniEnv = process.env): AniStatus {
     percent: config.percent,
     dubEnabled: config.dubEnabled,
     requireSubtitle: config.requireSubtitle,
+    anikotoRequireSubtitle: config.anikotoRequireSubtitle,
+    masterHosts: [...config.masterHosts],
     configured: Boolean(config.baseUrl && config.apiKey),
     breaker: {
       open: state.breakerOpenUntil > now,

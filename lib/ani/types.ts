@@ -28,6 +28,15 @@ export type AniSubtitleTrack = {
   language_verified?: boolean
 }
 
+/**
+ * `intro` / `outro` markers, `[start, end]` in seconds.
+ *
+ * AniKoto answers `[31, 111]` for a real opening and `[0, 0]` (or null) when it
+ * does not know. Both forms are normalised in `lib/ani/resolve.ts`: valid means
+ * two finite numbers with `end > start`, anything else is null.
+ */
+export type AniTimeRange = [number, number] | null
+
 export type AniVariant = {
   quality?: string
   playlist_url?: string
@@ -68,6 +77,10 @@ export type AniStreamPayload = {
     segments?: Record<string, string>
   } | null
   url_lifetime?: { observed_valid_for_minutes?: number | null }
+  /** AniKoto: `[start, end]` seconds, `[0, 0]`/null when unknown. */
+  intro?: AniTimeRange | { start?: number, end?: number } | null
+  /** AniKoto: `[start, end]` seconds, `[0, 0]`/null when unknown. */
+  outro?: AniTimeRange | { start?: number, end?: number } | null
   mal?: AniMalContext | null
 }
 

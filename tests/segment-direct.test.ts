@@ -79,7 +79,8 @@ describe('rewriteManifest without DIRECT_SEGMENT_HOSTS', () => {
 describe('rewriteManifest with DIRECT_SEGMENT_HOSTS', () => {
   it('leaves matching segments absolute and still proxies playlists, KEY and MAP', async () => {
     setHosts('hls1.drama1.cfd')
-    const body = await rewriteManifest(PLAYLIST, 'https://hls1.drama1.cfd/abc/master.m3u8', { Referer: 'https://zokoanime.video/' })
+    // No Referer in the signed headers: the browser can fetch these itself.
+    const body = await rewriteManifest(PLAYLIST, 'https://hls1.drama1.cfd/abc/master.m3u8', {})
     const out = lines(body)
 
     expect(out[6]).toBe('https://hls1.drama1.cfd/abc/0001.ts.jpg')
@@ -93,6 +94,45 @@ describe('rewriteManifest with DIRECT_SEGMENT_HOSTS', () => {
   it('keeps a segment host that is not on the list proxied', async () => {
     setHosts('hls.dramahot.top')
     const body = await rewriteManifest(PLAYLIST, 'https://hls1.drama1.cfd/abc/master.m3u8', { Referer: 'https://zokoanime.video/' })
+    expect(lines(body)[6]).toMatch(/^\/api\/proxy\/segment\?/)
+  })
+})
+
+describe('rewriteManifest when the signed headers carry a Referer', () => {
+  // AniKoto answers 403 to every request without `Referer: https://megaplay.buzz/`
+  // and to every other Referer. A browser sends the site's own URL, so it can
+  // never fetch these segments itself: the Referer must win over the env var.
+  const REFERER = { Referer: 'https://megaplay.buzz/' }
+
+  it('proxies every media URI even when its host is on DIRECT_SEGMENT_HOSTS', async () => {
+    setHosts('hls1.drama1.cfd,drama1.cfd,nexabloom.top')
+    const body = await rewriteManifest(PLAYLIST, 'https://hls1.drama1.cfd/abc/master.m3u8', REFERER)
+    const out = lines(body)
+
+    expect(out[6]).toMatch(/^\/api\/proxy\/segment\?/)
+    expect(out[7]).toMatch(/^\/api\/proxy\/segment\?/)
+    expect(body).not.toContain('https://hls1.drama1.cfd/abc/0001.ts.jpg')
+    // ... and they are signed WITH the Referer the CDN demands.
+    const signed = new URLSearchParams(out[6].slice(out[6].indexOf('?') + 1)).get('h') ?? ''
+    const headers = JSON.parse(Buffer.from(signed.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'))
+    expect(headers).toEqual(REFERER)
+  })
+
+  it('still leaves segments direct for a stream with no Referer', async () => {
+    setHosts('hls1.drama1.cfd')
+    const body = await rewriteManifest(PLAYLIST, 'https://hls1.drama1.cfd/abc/master.m3u8', {})
+    expect(lines(body)[6]).toBe('https://hls1.drama1.cfd/abc/0001.ts.jpg')
+  })
+
+  it('treats an empty Referer as no Referer', async () => {
+    setHosts('hls1.drama1.cfd')
+    const body = await rewriteManifest(PLAYLIST, 'https://hls1.drama1.cfd/abc/master.m3u8', { Referer: '' })
+    expect(lines(body)[6]).toBe('https://hls1.drama1.cfd/abc/0001.ts.jpg')
+  })
+
+  it('matches the header name case-insensitively', async () => {
+    setHosts('hls1.drama1.cfd')
+    const body = await rewriteManifest(PLAYLIST, 'https://hls1.drama1.cfd/abc/master.m3u8', { referer: 'https://megaplay.buzz/' })
     expect(lines(body)[6]).toMatch(/^\/api\/proxy\/segment\?/)
   })
 })

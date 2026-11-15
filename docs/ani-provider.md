@@ -135,9 +135,12 @@ demux that if it trusts the header, so `/api/proxy/segment` sniffs the body:
   player retries and then excludes the provider instead of feeding markup to the
   demuxer;
 - anything else keeps its upstream content type;
-- a `Range` request that does not start at byte 0 is streamed through untouched
-  (its first byte is not a sync byte, so sniffing it would prove nothing), and a
-  body over 8 MB is streamed instead of buffered.
+- only a *suspicious* content type is sniffed at all (missing, `image/*`,
+  `text/html`, `application/octet-stream`, `binary/octet-stream`, `text/plain`):
+  a known length up to 2 MB is buffered, anything larger or chunked is decided
+  from the first 64 KB and the rest keeps streaming;
+- a `Range` request that does not start at byte 0 is streamed through untouched,
+  because its first byte is not a sync byte and sniffing it would prove nothing.
 
 ### intro / outro
 
@@ -189,6 +192,11 @@ every segment, because each one needs `Referer: https://megaplay.buzz/`. A
 10-minute episode is roughly 200-600 MB, and Vercel bills the edge request time
 and the bandwidth for all of it. That is a real cost the ZokoAnime path mostly
 avoided by allowing direct CDN segments.
+
+`/api/proxy/segment` sniffs only a suspicious content type and then reads at most
+64 KB of it (or buffers 2 MB when the length is known and small); every properly
+typed segment and mp4 is streamed straight through, so this shared route adds no
+buffering cost to a stream that is not ani's.
 
 So: start at `ANI_PROVIDER_PERCENT=10`, watch Vercel → Usage → *Edge Requests*,
 *Data Transfer* and *Function/Edge execution time*, and raise it in steps only

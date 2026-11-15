@@ -49,7 +49,11 @@ afterEach(() => {
 describe('GET /api/proxy/segment media sniffing', () => {
   it('serves a TS segment that arrives as image/jpeg as video/mp2t', async () => {
     const body = tsBody()
-    const fetchMock = vi.fn(async () => new Response(body, { headers: { 'content-type': 'image/jpeg' } }))
+    // A segment host answers with a length; PLAY-4 only restates it in the small
+    // buffered path and never invents one, so the fixture must carry it.
+    const fetchMock = vi.fn(async () => new Response(body, {
+      headers: { 'content-type': 'image/jpeg', 'content-length': String(body.length) },
+    }))
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
     const response = await call(await signedPath())

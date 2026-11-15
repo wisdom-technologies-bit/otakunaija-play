@@ -164,9 +164,10 @@ describe('buildAniProviderStream', () => {
     expect(stream.subtitles[0].default).toBe(true)
     expect(stream.subtitles[0].srclang).toBe('en')
 
-    // vtt track: responseFor signs its own url. srt/ass: pre-signed ani token.
-    expect(stream.subtitlePaths[0]).toBeNull()
-    expect(stream.subtitlePaths[1]).toBeNull()
+    // vtt tracks are signed from the RAW absolute url through the existing
+    // subtitle proxy. srt/ass (converted) go through our own ani token.
+    expect(stream.subtitlePaths[0]).toMatch(/^\/api\/proxy\/subtitle\?/)
+    expect(stream.subtitlePaths[1]).toMatch(/^\/api\/proxy\/subtitle\?/)
     expect(stream.subtitlePaths[2]).toMatch(/^\/api\/proxy\/ani-subtitle\?/)
     expect(stream.subtitlePaths[3]).toMatch(/^\/api\/proxy\/ani-subtitle\?/)
   })

@@ -25,6 +25,12 @@ export type AniConfig = {
   dubEnabled: boolean
   /** A sub stream needs at least one playable subtitle track, like Anivexa sub providers. */
   requireSubtitle: boolean
+  /**
+   * AniKoto only. Some episodes return zero subtitle tracks (hard-sub or no
+   * subs, the API cannot say). `1` keeps the strict rule, `0` lets those
+   * episodes play. The owner flips it after checking by eye.
+   */
+  anikotoRequireSubtitle: boolean
   timeoutMs: number
   maxConcurrency: number
   /**
@@ -33,6 +39,24 @@ export type AniConfig = {
    * owner uses a separate key for Play so it never shares KumoriTV's budget.
    */
   ratePerMin: number
+  /**
+   * Hosts a `master_url` may live on, subdomains included. `ANI_MASTER_HOSTS`
+   * replaces the built-in list; segments are NOT host-checked because those
+   * hosts rotate (the signed proxy only ever fetches what we signed).
+   */
+  masterHosts: string[]
+}
+
+/**
+ * The master hosts the service has actually served: `nexabloom.top` (AniKoto,
+ * the new first source), plus the older ZokoAnime hosts. `ANI_MASTER_HOSTS`
+ * replaces this list entirely; a host not on it is refused, never probed.
+ */
+export const DEFAULT_MASTER_HOSTS = ['nexabloom.top', 'dramahot.top', 'drama1.cfd'] as const
+
+function masterHosts(value: string | undefined): string[] {
+  const parsed = hostList(value)
+  return parsed.length > 0 ? parsed : [...DEFAULT_MASTER_HOSTS]
 }
 
 const TRUE_VALUES = new Set(['1', 'true', 'yes', 'on'])
@@ -52,6 +76,16 @@ function int(value: string | undefined, fallback: number, min: number, max: numb
 function text(value: string | undefined): string | null {
   const trimmed = (value ?? '').trim()
   return trimmed.length > 0 ? trimmed : null
+}
+
+/** Comma-separated host list; empty means "use the defaults". */
+function hostList(value: string | undefined): string[] {
+  return (value ?? '')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .map((entry) => entry.replace(/^\.+/, ''))
+    .map((entry) => entry.replace(/\/.*$/, ''))
+    .filter((entry) => entry.length > 0)
 }
 
 function baseUrl(value: string | undefined): string | null {
@@ -74,9 +108,11 @@ export function readAniConfig(env: AniEnv = process.env): AniConfig {
     percent: int(env.ANI_PROVIDER_PERCENT, 100, 0, 100),
     dubEnabled: flag(env.ANI_DUB_ENABLED, false),
     requireSubtitle: flag(env.ANI_REQUIRE_SUBTITLE, true),
+    anikotoRequireSubtitle: flag(env.ANI_ANIKOTO_REQUIRE_SUBTITLE, true),
     timeoutMs: int(env.ANI_API_TIMEOUT_MS, 12_000, 1_000, 60_000),
     maxConcurrency: int(env.ANI_MAX_CONCURRENCY, 3, 1, 32),
     ratePerMin: int(env.ANI_RATE_PER_MIN, 30, 1, 600),
+    masterHosts: masterHosts(env.ANI_MASTER_HOSTS),
   }
 }
 

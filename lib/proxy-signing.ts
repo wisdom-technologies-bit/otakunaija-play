@@ -76,11 +76,23 @@ export function signedResourceUrl(targetUrl: string, headers: Record<string, str
  * a DIRECT_SEGMENT_HOSTS host is left absolute so the browser fetches it from
  * the CDN directly; with the default `none` every media URI is proxied exactly
  * as before.
+ *
+ * EXCEPTION, and it wins over the environment: when the signed headers carry a
+ * `Referer`, every media URI keeps being proxied no matter what
+ * DIRECT_SEGMENT_HOSTS says. Those segments only answer 200 to one specific
+ * Referer (AniKoto: `https://megaplay.buzz/`, 403 for every other value), and a
+ * browser cannot send it: it sends the site's own URL. Handing such a segment
+ * to the browser would break playback on a host the owner has already enabled
+ * for a different provider, so the Referer, not the variable, decides.
  */
 export async function rewriteManifest(body: string, targetUrl: string, headers: Record<string, string>) {
   const baseUrl = targetUrl.slice(0, targetUrl.lastIndexOf('/') + 1)
   const resolve = (value: string) => /^https?:/i.test(value) ? value : new URL(value, baseUrl).toString()
   const directHosts = directSegmentHosts()
+  // A Referer requirement makes direct fetching impossible for the browser.
+  const refererBound = Object.entries(headers).some(
+    ([key, value]) => key.toLowerCase() === 'referer' && String(value ?? '').trim().length > 0,
+  )
   const lines = body.split(/\r?\n/)
   const rewritten: string[] = []
 
@@ -104,7 +116,7 @@ export async function rewriteManifest(body: string, targetUrl: string, headers: 
       rewritten.push(await signProxyUrl(absolute, headers, '/api/proxy/manifest'))
       continue
     }
-    if (isDirectSegment(absolute, directHosts)) {
+    if (!refererBound && isDirectSegment(absolute, directHosts)) {
       rewritten.push(absolute)
       continue
     }

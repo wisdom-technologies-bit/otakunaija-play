@@ -13,7 +13,16 @@ vi.mock('@/lib/supabase/admin', () => ({
 import { GET } from '@/app/api/watch/[playId]/route'
 import { verifyAniSubtitleToken, verifyProxySignature } from '@/lib/proxy-signing'
 import { __resetAniState } from '@/lib/ani/client'
-import { ANI_BASE, ANI_ENV, MAL_ID, SENTINEL_KEY, aniStreamPayload } from './fixtures/ani'
+import {
+  ANI_BASE,
+  ANI_ENV,
+  ANIKOTO_REFERER,
+  MAL_ID,
+  SENTINEL_KEY,
+  aniStreamPayload,
+  anikotoNoSubtitlePayload,
+  anikotoStreamPayload,
+} from './fixtures/ani'
 
 const ANIVEXA = 'https://anivexa.otakunaija.name.ng'
 const originalFetch = globalThis.fetch
@@ -368,5 +377,65 @@ describe('error bodies', () => {
     expect(serialized).not.toContain(ANI_BASE)
     expect(serialized).not.toContain('X-API-Key')
     expect((body.trace as string[])[0]).toMatch(/^ani: failed /)
+  })
+})
+
+describe('watch resolver on an AniKoto payload (real 2026-11-15 shape)', () => {
+  it('returns the intro/outro markers and CDN subtitle urls the player can fetch', async () => {
+    useAniEnv()
+    fetchRouter({
+      [`${ANI_BASE}/v1/streams`]: () => Response.json(anikotoStreamPayload()),
+      'https://fetch.nexabloom.top': () => new Response('#EXTM3U\n#EXT-X-VERSION:3\n'),
+    })
+    const { status, body } = await resolveWatch()
+
+    expect(status).toBe(200)
+    expect(body.provider).toBe('ani')
+    expect(body.headers).toEqual({})
+    // Same fields, same shape as an Anivexa win.
+    expect(body.intro).toEqual({ start: 31, end: 111 })
+    expect(body.outro).toEqual({ start: 1376, end: 1447 })
+
+    const stream = await decode(body.streamUrl as string)
+    expect(stream.targetUrl).toBe('https://fetch.nexabloom.top/hls/one-piece/ep1/master.m3u8')
+    expect(stream.headers).toEqual({ Referer: ANIKOTO_REFERER })
+
+    // DEFECT 1: every non-converted track points at the public CDN, signed with
+    // the subtitle Referer. No ani-api path, no relative proxied_url, no key.
+    const subtitles = body.subtitles as Array<Record<string, unknown>>
+    // Every AniKoto track claims `language: "en"`, so the provider's own order
+    // decides once the default track is placed first: pt (default), es, en.
+    expect(subtitles.map((track) => track.srclang)).toEqual(['pt', 'es', 'en'])
+    for (const track of subtitles) {
+      const url = String(track.url)
+      expect(url.startsWith('/api/proxy/subtitle?')).toBe(true)
+      const signed = await decode(url)
+      expect(signed.valid).toBe(true)
+      expect(String(signed.targetUrl).startsWith('https://subs1.mysubsplay.com/anikoto/')).toBe(true)
+      expect(JSON.stringify(signed)).not.toContain('/v1/subtitles')
+      expect(JSON.stringify(signed)).not.toContain(ANI_BASE)
+      expect(JSON.stringify(signed)).not.toContain(SENTINEL_KEY)
+      expect(signed.headers).toEqual({ Referer: ANIKOTO_REFERER })
+    }
+    expect(JSON.stringify(body)).not.toContain('/v1/subtitles')
+  })
+
+  it('falls through to Anivexa for a zero-subtitle episode while the strict rule is on', async () => {
+    useAniEnv({ ANI_ANIKOTO_REQUIRE_SUBTITLE: '1' })
+    fetchRouter({ [`${ANI_BASE}/v1/streams`]: () => Response.json(anikotoNoSubtitlePayload()) })
+    const { body } = await resolveWatch('?debug=1')
+    expect(body.provider).toBe('anipm')
+    expect((body.trace as string[])[0]).toMatch(/^ani: failed ANI_NO_SUBTITLE \d+ms$/)
+  })
+
+  it('serves that same episode when the owner sets ANI_ANIKOTO_REQUIRE_SUBTITLE=0', async () => {
+    useAniEnv({ ANI_ANIKOTO_REQUIRE_SUBTITLE: '0' })
+    fetchRouter({
+      [`${ANI_BASE}/v1/streams`]: () => Response.json(anikotoNoSubtitlePayload()),
+      'https://fetch.nexabloom.top': () => new Response('#EXTM3U\n#EXT-X-VERSION:3\n'),
+    })
+    const { body } = await resolveWatch()
+    expect(body.provider).toBe('ani')
+    expect(body.subtitles).toEqual([])
   })
 })

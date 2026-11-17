@@ -3,6 +3,7 @@ import { signProxyUrl } from '@/lib/proxy-signing'
 import { resolveMalId, type MinimalSupabase } from '@/lib/ani/mal'
 import { tryAni } from '@/lib/ani/resolve'
 import { srclangForLabel } from '@/lib/subtitle-language'
+import { readCachedStream, writeCachedStream, type StreamCacheClient } from '@/lib/stream-cache'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -355,6 +356,21 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   const debug = new URL(_request.url).searchParams.get('debug') === '1'
   const trace: string[] = []
 
+  // A payload already resolved for this episode is returned before any upstream
+  // work. The ani-api lookup is a live scrape and costs seconds on its own, so a
+  // repeat watch (any user, any instance) should never pay it again. Exclusions
+  // are excluded from the cache on purpose: the player sends one after a
+  // playback failure and must get a fresh attempt, not the stream that failed.
+  const cacheClient = supabase as unknown as StreamCacheClient
+  if (!hasExclusions && !debug) {
+    const [cachedSub, cachedDub] = await Promise.all([
+      readCachedStream(cacheClient, { playId, audio: 'sub' }),
+      readCachedStream(cacheClient, { playId, audio: 'dub' }),
+    ])
+    const cachedPayload = cachedSub ?? cachedDub
+    if (cachedPayload) return json(cachedPayload)
+  }
+
   // Our own ani-api is tried FIRST, before the resolved-provider cache and the
   // Anivexa race. Everything it needs is gated inside `tryAni`: flag, base URL,
   // key, rollout percentage, the `ani:` exclusion the player sends back after a
@@ -407,6 +423,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
     )
     // Deliberately no resolved_provider / resolved_audio / resolved_at write and
     // no needs_resync change: Anivexa's provider health must stay untouched.
+    await writeCachedStream(cacheClient, { playId, audio: 'sub' }, payload as unknown as Record<string, unknown>)
     return json(debug ? { ...payload, trace } : payload)
   }
   trace.push(`ani: ${ani.status} ${ani.reason} ${ani.ms}ms`)
@@ -454,16 +471,20 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
           const { error: resyncClearError } = await supabase.from('episodes').update({ needs_resync: false, resync_requested_at: null }).eq('play_id', playId)
           if (resyncClearError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
         }
-        return json(
-          await responseFor(
-            playId,
-            episode.resolved_audio,
-            episode.resolved_provider,
-            stream,
-            stream.intro,
-            stream.outro,
-          ),
+        const payload = await responseFor(
+          playId,
+          episode.resolved_audio,
+          episode.resolved_provider,
+          stream,
+          stream.intro,
+          stream.outro,
         )
+        await writeCachedStream(
+          cacheClient,
+          { playId, audio: episode.resolved_audio },
+          payload as unknown as Record<string, unknown>,
+        )
+        return json(payload)
       }
     }
   }
@@ -506,5 +527,6 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
   if (updateError) return json({ error: 'RESOLUTION_UPDATE_FAILED' }, 500)
 
   const payload = await responseFor(playId, winner.audio, winner.provider, winner.stream, winner.intro, winner.outro)
+  await writeCachedStream(cacheClient, { playId, audio: winner.audio }, payload as unknown as Record<string, unknown>)
   return json(debug ? { ...payload, trace } : payload)
 }

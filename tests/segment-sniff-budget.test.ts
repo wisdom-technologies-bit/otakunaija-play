@@ -329,8 +329,9 @@ describe('PLAY-4: a large suspicious body is decided from its prefix only', () =
     // tail has to reappear ahead of everything after it.
     const total = 123 * 100
     const expected = new Uint8Array(total)
-    for (let index = 0; index < total; index += 1) expected[index] = index % 251
-    expected[0] = 0x47
+    // A genuine TS body: the second sync byte at offset 188 is part of the
+    // stronger check the fix adds, so the fixture has to be real TS.
+    for (let index = 0; index < total; index += 1) expected[index] = index % 188 === 0 ? 0x47 : index % 251
     const source = instrumented(total, 100, (offset) => expected[offset])
     upstream(source.body, { 'content-type': 'application/octet-stream' })
 
@@ -346,7 +347,7 @@ describe('PLAY-4: a large suspicious body is decided from its prefix only', () =
   it('stops reading at the 64 KB ceiling when the probe arrives in tiny pieces', async () => {
     // One-byte chunks: the probe needs 64 reads, never the whole body.
     const total = 1 * MIB
-    const source = instrumented(total, 1, (offset) => (offset === 0 ? 0x47 : 0x30))
+    const source = instrumented(total, 1, (offset) => (offset % 188 === 0 ? 0x47 : 0x30))
     upstream(source.body, { 'content-type': 'binary/octet-stream' })
 
     const response = await call(await signedPath('https://cdn.example/seg.bin'))

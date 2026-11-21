@@ -2,37 +2,59 @@
  * Segment proxy (edge).
  *
  * Fetches the signed media URI with the signed headers and hands the bytes back
- * to the player. Two upstream habits are handled explicitly:
+ * to the player.
  *
- *  - AniKoto serves real MPEG-TS bytes under `image/jpeg` with a `.jpg`
- *    extension (`seg-1-v1-a1.jpg`). A player that trusts the content type will
- *    refuse them, so a suspicious body is sniffed: a first byte of 0x47 is a TS
- *    sync byte and the response is relabelled `video/mp2t` whatever the upstream
- *    called it.
- *  - A CDN that answers an expired or blocked request with an HTML error page
- *    would otherwise reach the demuxer as "video". Those are rejected as a
- *    failed fetch, so the player's retry path runs instead of a decode error.
+ * THE RULE: the BODY decides what a segment is, never the label.
  *
- * Sniffing is the exception, not the rule (PLAY-4). This route serves every
- * stream, not only an ani one, and before PLAY-3 it streamed the body straight
- * through. A body is only ever looked at when its upstream content type is
- * suspicious:
+ * The AniKoto/MegaPlay CDN hosts rotate both the file extension and the
+ * `Content-Type` of every segment while the bytes stay real MPEG-TS: measured on
+ * 2026-11-21 for play_id 21-1180, `seg-f3-00001.html` answered HTTP 200 with
+ * 931,164 bytes, `content-type: text/html`, and 0x47 at offsets 0, 188 and 376.
+ * Index 2 came back as `application/javascript` and index 3 as `text/css`, both
+ * real TS as well. Before this rule the label alone decided: `text/html` was
+ * thrown away as an error page (so hls.js stalled at 00:03 with
+ * `bufferSeekOverHole`) and `text/css` / `application/javascript` reached the
+ * demuxer labelled as stylesheets.
  *
- *  - missing, `image/*`, `text/html`, `application/octet-stream`,
- *    `binary/octet-stream` or `text/plain`, and the request is for a body whose
- *    first byte is meaningful (a full body, or a range starting at byte 0);
+ * So a suspicious body is sniffed and accepted when its bytes say media:
+ *
+ *  - MPEG-TS: 0x47 at offset 0, and - once at least 189 bytes are in hand -
+ *    again at offset 188 (the 188-byte packet sync). A range too short to reach
+ *    offset 188 falls back to the first byte alone. Accepted bodies are
+ *    relabelled `video/mp2t` whatever the upstream called them.
+ *  - fragmented MP4 (`ftyp`/`styp`/`moof`/`sidx` at offset 4), relabelled
+ *    `video/mp4`, if the route is ever handed one.
+ *
+ * A body is rejected only when it LOOKS like markup or JSON: the first
+ * non-whitespace byte is `<`, or `{` / `[` followed by text. That is what a CDN
+ * error page or an expired-token JSON answer looks like, and it is rejected as a
+ * failed fetch so the player's retry path runs instead of the demuxer decoding
+ * markup. The label is not consulted for that decision either: an error page is
+ * refused under any `Content-Type`, and `text/html` on its own never rejects a
+ * real segment.
+ *
+ * Sniffing is still the exception, not the rule (PLAY-4). A body is only ever
+ * looked at when its upstream type is not one we trust as-is - anything that is
+ * not `video/*`, `audio/*`, `application/vnd.apple.mpegurl`,
+ * `application/x-mpegurl` or `video/mp2t`. That means the rotating `text/css`,
+ * `application/javascript`, `image/*`, octet-stream, `text/plain` and missing
+ * labels are all sniffed now, not just the image and octet-stream ones.
+ *
+ * The bounds are unchanged:
+ *
+ *  - a body is only sniffed when the request is for a body whose first byte is
+ *    meaningful (a full body, or a range starting at byte 0);
  *  - known length <= 2 MB: the whole body is buffered, which is cheap at that
  *    size and lets a relabel also correct `Content-Length`;
  *  - otherwise (unknown length, chunked transfer, or a larger body): at most the
- *    first 64 KB is read through a stream reader, and the rest keeps streaming
- *    with the bytes already read replayed in front, so memory stays bounded and
- *    no byte is lost or reordered.
+ *    first 512 bytes are read through a stream reader, and the rest keeps
+ *    streaming with the bytes already read replayed in front, so memory stays
+ *    bounded and no byte is lost or reordered;
+ *  - a correctly typed `video/*` response still streams with zero reads before
+ *    the Response is returned, so it pays no extra time-to-first-byte.
  *
- * Everything else (`video/*`, `audio/*`, `application/vnd.apple.mpegurl`, any
- * trustworthy type, and any mid-file range) is streamed through untouched,
- * exactly as this route did before PLAY-3, apart from the CORS and cache
- * headers: no bytes are read before the Response is returned, so a correctly
- * labelled segment pays no extra time-to-first-byte.
+ * A range from the middle of a file is never sniffed: its first byte is not a
+ * sync byte and proves nothing.
  */
 
 import { corsHeaders, proxyJson, verifyProxySignature, withDefaultUserAgent } from '@/lib/proxy-signing'
@@ -45,14 +67,25 @@ const SNIFF_MAX_BYTES = 2 * 1024 * 1024
 /** Hard cap on the bytes read before a large or chunked suspicious body starts streaming. */
 const SNIFF_PREFIX_BYTES = 64 * 1024
 /**
- * Both checks only need the start of the body: the sync byte, and the first
- * non-whitespace byte for the markup test. Reading stops there, which is why a
- * chunked error page still streams instead of being collected.
+ * The probe has to reach offset 188 to confirm the second TS sync byte, so it is
+ * 512 bytes: enough for both media checks, still tiny next to a 931 KB segment,
+ * and reading stops there, which is why a chunked error page still streams
+ * instead of being collected.
  */
-const HTML_PROBE_BYTES = 64
+const PROBE_BYTES = 512
 const TS_SYNC_BYTE = 0x47
+/** MPEG-TS repeats its sync byte every 188 bytes; offset 188 is the second one. */
+const TS_SECOND_SYNC_OFFSET = 188
 const DEFAULT_TS_TYPE = 'video/mp2t'
-const SUSPICIOUS_TYPES = ['application/octet-stream', 'binary/octet-stream', 'text/plain']
+const DEFAULT_MP4_TYPE = 'video/mp4'
+/** Box types a fragmented-MP4 segment can start with, read at offset 4. */
+const FMP4_BOXES = ['ftyp', 'styp', 'moof', 'sidx']
+/**
+ * Types trusted as-is: never sniffed, never relabelled, streamed untouched. The
+ * complement is what gets sniffed, so `text/css` and `application/javascript`
+ * (two of the disguises) are looked at while a real `video/*` never is.
+ */
+const TRUSTED_TYPES = ['application/vnd.apple.mpegurl', 'application/x-mpegurl', 'video/mp2t']
 
 /**
  * Byte ranges.
@@ -136,21 +169,21 @@ function mediaType(contentType: string) {
   return contentType.split(';')[0].trim().toLowerCase()
 }
 
-function isHtmlType(contentType: string) {
+/** A type whose bytes are believed without looking: no read, no relabel. */
+function isTrustedType(contentType: string) {
   const type = mediaType(contentType)
-  return type === 'text/html' || type === 'application/xhtml+xml'
+  if (!type) return false
+  if (type.startsWith('video/') || type.startsWith('audio/')) return true
+  return TRUSTED_TYPES.includes(type)
 }
 
 /**
- * A type worth looking at. `image/*` and the octet-stream aliases are AniKoto's
- * habit and a mislabelled CDN's habit; a missing type proves nothing either way.
+ * Everything we do not trust: `image/*`, `text/html`, `text/css`,
+ * `application/javascript`, the octet-stream aliases, `text/plain`, JSON, and a
+ * missing type. These hosts rotate through all of them, so the body decides.
  */
 function isSuspiciousType(contentType: string) {
-  const type = mediaType(contentType)
-  if (!type) return true
-  if (type.startsWith('image/')) return true
-  if (isHtmlType(type)) return true
-  return SUSPICIOUS_TYPES.includes(type)
+  return !isTrustedType(contentType)
 }
 
 /**
@@ -163,26 +196,67 @@ function knownLength(value: string | null): number | null {
   return /^\d+$/.test(trimmed) ? Number(trimmed) : null
 }
 
-/** Leading whitespace ignored: a CDN often prefixes its error page with a newline. */
-function looksLikeHtml(bytes: Uint8Array) {
-  for (const byte of bytes.subarray(0, HTML_PROBE_BYTES)) {
-    if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue
-    return byte === 0x3c // '<'
-  }
-  return false
+function isWhitespace(byte: number) {
+  return byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d
 }
 
-function isTs(bytes: Uint8Array) {
-  return bytes.length > 0 && bytes[0] === TS_SYNC_BYTE
+/**
+ * Markup or JSON, judged by bytes alone: a CDN error page (`<!doctype`, `<html`,
+ * or the same after leading whitespace) and an expired-token answer
+ * (`{"error":...}`) both start this way. The label is irrelevant here, which is
+ * the whole point: an error page is refused whatever type it claims.
+ */
+function looksLikeMarkup(bytes: Uint8Array) {
+  let index = 0
+  while (index < bytes.length && index < PROBE_BYTES && isWhitespace(bytes[index])) index += 1
+  if (index >= bytes.length) return false
+  const first = bytes[index]
+  if (first === 0x3c) return true // '<'
+  if (first !== 0x7b && first !== 0x5b) return false // '{' '['
+  const next = bytes[index + 1]
+  if (next === undefined) return false
+  return isWhitespace(next) || (next >= 0x21 && next <= 0x7e)
 }
 
+/**
+ * MPEG-TS: the sync byte, plus the second sync byte at offset 188 once enough of
+ * the body is in hand. A range shorter than 189 bytes cannot reach it, so the
+ * first byte alone has to do.
+ */
+function isMpegTs(bytes: Uint8Array) {
+  if (bytes.length === 0 || bytes[0] !== TS_SYNC_BYTE) return false
+  if (bytes.length <= TS_SECOND_SYNC_OFFSET) return true
+  return bytes[TS_SECOND_SYNC_OFFSET] === TS_SYNC_BYTE
+}
+
+/** A fragmented-MP4 segment: a 4-byte box size then `ftyp`/`styp`/`moof`/`sidx`. */
+function isFragmentedMp4(bytes: Uint8Array) {
+  if (bytes.length < 8) return false
+  const box = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7])
+  return FMP4_BOXES.includes(box)
+}
+
+/**
+ * The label to hand the player: the bytes win when they prove media, otherwise
+ * the upstream label, otherwise a guess from the path.
+ */
+function responseType(bytes: Uint8Array, upstreamType: string, targetUrl: string) {
+  if (isMpegTs(bytes)) return DEFAULT_TS_TYPE
+  if (isFragmentedMp4(bytes)) return DEFAULT_MP4_TYPE
+  return upstreamType || defaultType(targetUrl)
+}
+
+/**
+ * Last resort only: no upstream label and a body that proves nothing. The
+ * extension never decides whether a body is accepted, only this fallback label.
+ */
 function defaultType(targetUrl: string) {
-  return targetUrl.toLowerCase().includes('.ts') ? DEFAULT_TS_TYPE : 'video/mp4'
+  return targetUrl.toLowerCase().includes('.ts') ? DEFAULT_TS_TYPE : DEFAULT_MP4_TYPE
 }
 
 /**
  * Reads just enough of the body to decide, and keeps every byte it consumed.
- * `head` is at most HTML_PROBE_BYTES; `tail` holds the rest in order, so the
+ * `head` is at most PROBE_BYTES; `tail` holds the rest in order, so the
  * replayed stream below is byte-for-byte the upstream body.
  */
 async function readProbe(body: ReadableStream<Uint8Array>) {
@@ -190,14 +264,14 @@ async function readProbe(body: ReadableStream<Uint8Array>) {
   const parts: Uint8Array[] = []
   let total = 0
   let done = false
-  while (total < HTML_PROBE_BYTES && !done && total < SNIFF_PREFIX_BYTES) {
+  while (total < PROBE_BYTES && !done && total < SNIFF_PREFIX_BYTES) {
     const step = await reader.read()
     if (step.done) { done = true; break }
     if (!step.value || step.value.length === 0) continue
     parts.push(step.value)
     total += step.value.length
   }
-  const head = new Uint8Array(Math.min(HTML_PROBE_BYTES, total))
+  const head = new Uint8Array(Math.min(PROBE_BYTES, total))
   const tail: Uint8Array[] = []
   let filled = 0
   for (const part of parts) {
@@ -272,16 +346,17 @@ async function handleProxy(request: Request) {
     if (length !== null && length <= SNIFF_MAX_BYTES && response.body) {
       const bytes = new Uint8Array(await response.arrayBuffer())
 
-      // An HTML error page is never a segment. Reject it so the player retries
-      // (and, for an ani stream, excludes the provider) instead of feeding markup
-      // to the demuxer.
-      if (isHtmlType(upstreamType) || looksLikeHtml(bytes)) {
+      // Markup is never a segment, whatever the label says. Reject it so the
+      // player retries (and, for an ani stream, excludes the provider) instead of
+      // feeding an error page to the demuxer.
+      if (looksLikeMarkup(bytes)) {
         return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
       }
 
-      // The sync byte decides, not the label: TS under `image/jpeg` (AniKoto) and
-      // a mislabelled `application/octet-stream` are both real media.
-      headers.set('Content-Type', isTs(bytes) ? DEFAULT_TS_TYPE : upstreamType || defaultType(verified.targetUrl))
+      // The bytes decide, not the label: TS under `text/html` (the measured
+      // 931 KB segment), `text/css`, `application/javascript`, `image/jpeg` or
+      // `application/octet-stream` is all real media and all becomes video/mp2t.
+      headers.set('Content-Type', responseType(bytes, upstreamType, verified.targetUrl))
       if (fullBody && bytes.length > 0) headers.set('Content-Length', String(bytes.length))
 
       return new Response(bytes, { status: response.status, headers })
@@ -295,12 +370,12 @@ async function handleProxy(request: Request) {
     }
 
     const probe = await readProbe(response.body)
-    if (isHtmlType(upstreamType) || looksLikeHtml(probe.head)) {
+    if (looksLikeMarkup(probe.head)) {
       await probe.reader.cancel().catch(() => {})
       return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
     }
 
-    headers.set('Content-Type', isTs(probe.head) ? DEFAULT_TS_TYPE : upstreamType || defaultType(verified.targetUrl))
+    headers.set('Content-Type', responseType(probe.head, upstreamType, verified.targetUrl))
     // Content-Length is only ever absent or larger than what was sniffed here, so
     // the passthrough value stays true and is left alone. Nothing is invented:
     // deciding whether the stream has ended would mean waiting for the next chunk.

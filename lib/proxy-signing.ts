@@ -56,8 +56,27 @@ export function withDefaultUserAgent(headers: Record<string, string>) {
   return next
 }
 
+/**
+ * One CORS shape for every response the player reads: /api/watch, the manifest,
+ * segment, subtitle and ani-subtitle proxies.
+ *
+ * `Range` is in Allow-Headers because a media element and hls.js send it for a
+ * byte-range request, and a non-simple header triggers a preflight. Without it
+ * the preflight answers 204 and the browser then refuses the actual request,
+ * which surfaces as a CORS error rather than the 206 the player expects.
+ *
+ * The Expose-Headers list is what a cross-origin caller may read back:
+ * Content-Length and Content-Range for seeking, Accept-Ranges to know whether
+ * seeking is supported at all, and Content-Type so a mislabelled TS segment can
+ * still be identified.
+ */
 export function corsHeaders() {
-  return { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' }
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Range',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type',
+  }
 }
 
 export function proxyJson(data: unknown, status: number) {

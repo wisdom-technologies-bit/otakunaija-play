@@ -1,5 +1,5 @@
 import { createAdminClient } from '@/lib/supabase/admin'
-import { signProxyUrl } from '@/lib/proxy-signing'
+import { corsHeaders, signProxyUrl } from '@/lib/proxy-signing'
 import { resolveMalId, type MinimalSupabase } from '@/lib/ani/mal'
 import { tryAni } from '@/lib/ani/resolve'
 import { srclangForLabel } from '@/lib/subtitle-language'
@@ -79,14 +79,9 @@ type EpisodeRow = {
   needs_resync: boolean
 }
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-}
 
 function json(data: unknown, status = 200) {
-  return Response.json(data, { status, headers: corsHeaders })
+  return Response.json(data, { status, headers: corsHeaders() })
 }
 
 async function fetchEpisodeCatalog(anilistId: number): Promise<Record<string, unknown> | null> {
@@ -333,10 +328,10 @@ async function findWinner(entries: ProviderEntry[], requireSubtitle: boolean, ex
 }
 
 export async function OPTIONS() {
-  return new Response(null, { status: 204, headers: corsHeaders })
+  return new Response(null, { status: 204, headers: corsHeaders() })
 }
 
-export async function GET(_request: Request, { params }: { params: Promise<{ playId: string }> }) {
+async function handleGet(_request: Request, { params }: { params: Promise<{ playId: string }> }) {
   const { playId } = await params
   const supabase = createAdminClient()
   const { data: episode, error } = await supabase
@@ -507,4 +502,23 @@ export async function GET(_request: Request, { params }: { params: Promise<{ pla
 
   const payload = await responseFor(playId, winner.audio, winner.provider, winner.stream, winner.intro, winner.outro)
   return json(debug ? { ...payload, trace } : payload)
+}
+
+/**
+ * Every exit carries CORS.
+ *
+ * The route body can throw outside its own guards: a missing Supabase
+ * credential, a signing secret that is not configured, a driver that rejects.
+ * Next then answers 500 itself, with no `Access-Control-Allow-Origin`, and the
+ * browser reports a CORS failure instead of the 500. That is exactly how a
+ * server-side fault used to look like a dead provider in the player.
+ */
+export async function GET(request: Request, context: { params: Promise<{ playId: string }> }) {
+  try {
+    return await handleGet(request, context)
+  } catch (error) {
+    // Fixed message: the detail could carry a connection string.
+    console.error('[watch] unhandled', error instanceof Error ? error.name : 'unknown')
+    return json({ error: 'INTERNAL_ERROR' }, 500)
+  }
 }

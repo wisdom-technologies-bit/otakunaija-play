@@ -54,6 +54,81 @@ const TS_SYNC_BYTE = 0x47
 const DEFAULT_TS_TYPE = 'video/mp2t'
 const SUSPICIOUS_TYPES = ['application/octet-stream', 'binary/octet-stream', 'text/plain']
 
+/**
+ * Byte ranges.
+ *
+ * A media element and hls.js send `Range` for a seek, and some CDN hosts ignore
+ * it and answer 200 with the whole body (measured: one host returned all
+ * 3,047,480 bytes for `Range: bytes=0-2000000`). Handing that 200 back to the
+ * player breaks seeking and makes a native player believe the resource is not
+ * seekable, so a single range is answered as a real 206: either passed through
+ * from an upstream that honoured it, or sliced locally from the full body.
+ *
+ * Only `bytes=start-` and `bytes=start-end` are handled. Anything else (a
+ * multi-range request) falls through to the previous behaviour untouched.
+ */
+const SINGLE_RANGE = /^bytes=(\d+)-(\d*)$/
+
+function parseRange(value: string | null): { start: number; end: number | null } | null {
+  if (!value) return null
+  const match = value.trim().match(SINGLE_RANGE)
+  if (!match) return null
+  const start = Number(match[1])
+  const end = match[2] === '' ? null : Number(match[2])
+  if (!Number.isFinite(start) || start < 0) return null
+  if (end !== null && (!Number.isFinite(end) || end < start)) return null
+  return { start, end }
+}
+
+/** Emits only `[start, end]` of the upstream body, then cancels the rest. */
+function sliceStream(body: ReadableStream<Uint8Array>, start: number, end: number | null) {
+  const reader = body.getReader()
+  const wanted = end === null ? null : end - start + 1
+  let skipped = 0
+  let sent = 0
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      for (;;) {
+        const step = await reader.read()
+        if (step.done) {
+          controller.close()
+          return
+        }
+        let chunk = step.value
+        if (!chunk || chunk.length === 0) continue
+        if (skipped < start) {
+          const needed = start - skipped
+          if (chunk.length <= needed) {
+            skipped += chunk.length
+            continue
+          }
+          chunk = chunk.subarray(needed)
+          skipped = start
+        }
+        if (wanted !== null) {
+          const remaining = wanted - sent
+          if (remaining <= 0) {
+            await reader.cancel().catch(() => {})
+            controller.close()
+            return
+          }
+          if (chunk.length > remaining) chunk = chunk.subarray(0, remaining)
+        }
+        sent += chunk.length
+        controller.enqueue(chunk)
+        if (wanted !== null && sent >= wanted) {
+          await reader.cancel().catch(() => {})
+          controller.close()
+        }
+        return
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason)
+    },
+  })
+}
+
 export function OPTIONS() { return new Response(null, { status: 204, headers: corsHeaders() }) }
 
 /** The media type without its parameters, so `text/html; charset=utf-8` matches. */
@@ -152,13 +227,13 @@ function replay(head: Uint8Array, tail: Uint8Array[], reader: ReadableStreamDefa
   })
 }
 
-export async function GET(request: Request) {
+async function handleProxy(request: Request) {
   const params = new URL(request.url).searchParams
   const verified = await verifyProxySignature(params.get('u') ?? '', params.get('h') ?? '', params.get('e') ?? '', params.get('s') ?? '')
   if (!verified.valid || !verified.targetUrl || !verified.headers) return proxyJson({ error: 'INVALID_OR_EXPIRED_SIGNATURE' }, 403)
+  const range = request.headers.get('Range')
   try {
     const upstreamHeaders = withDefaultUserAgent(verified.headers)
-    const range = request.headers.get('Range')
     if (range) upstreamHeaders.Range = range
 
     const response = await fetch(verified.targetUrl, {
@@ -232,4 +307,45 @@ export async function GET(request: Request) {
 
     return new Response(replay(probe.head, probe.tail, probe.reader, probe.done), { status: response.status, headers })
   } catch { return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502) }
+}
+
+/**
+ * Turns a 200 into a real 206 when the caller asked for a byte range.
+ *
+ * The previous code forwarded `Range` upstream and then returned whatever came
+ * back. When the CDN honoured it that was already a 206 and stays untouched;
+ * when the CDN ignored it (measured: one host answered `Range: bytes=0-2000000`
+ * with all 3,047,480 bytes and status 200) the player was told the whole
+ * resource was the answer, which breaks seeking and makes a native player
+ * believe the resource is not seekable at all.
+ *
+ * Everything else is left exactly as it was: no Range, an unparseable range, a
+ * 416, a 502, and every already-sniffed and relabelled body.
+ */
+function toPartial(response: Response, parsed: { start: number; end: number | null }) {
+  const headers = new Headers(response.headers)
+  const total = knownLength(headers.get('Content-Length'))
+  const start = parsed.start
+
+  if (total !== null && start >= total) {
+    headers.set('Content-Range', `bytes */${total}`)
+    headers.delete('Content-Length')
+    return new Response(null, { status: 416, headers })
+  }
+
+  const end = parsed.end !== null
+    ? (total !== null ? Math.min(parsed.end, total - 1) : parsed.end)
+    : (total !== null ? total - 1 : null)
+
+  headers.set('Content-Range', `bytes ${start}-${end !== null ? end : '*'}/${total !== null ? total : '*'}`)
+  if (end !== null) headers.set('Content-Length', String(end - start + 1))
+  if (!response.body) return new Response(null, { status: 206, headers })
+  return new Response(sliceStream(response.body, start, end), { status: 206, headers })
+}
+
+export async function GET(request: Request) {
+  const response = await handleProxy(request)
+  const parsed = parseRange(request.headers.get('Range'))
+  if (!parsed || response.status !== 200) return response
+  return toPartial(response, parsed)
 }

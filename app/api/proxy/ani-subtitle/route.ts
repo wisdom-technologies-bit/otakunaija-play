@@ -8,18 +8,23 @@
  *
  * The signed token carries only `{mal, ep, audio, trackId}`. The browser never
  * receives an ani-api URL, an ani-api token, or the key.
+ *
+ * The track fetch shares the upstream bounds in lib/proxy-upstream.ts: ~10 s to
+ * the headers, ~15 s with no body bytes, and one retry for a timeout, a network
+ * error or an upstream 5xx. A track that never arrives now fails fast with a
+ * CORS-carrying 504/502 instead of holding the request open.
  */
 
 import { readAniConfig } from '@/lib/ani/config'
 import { getAniStream } from '@/lib/ani/client'
 import { corsHeaders, proxyJson, verifyAniSubtitleToken } from '@/lib/proxy-signing'
+import { fetchUpstream, readTextUpstream, runWithRetry } from '@/lib/proxy-upstream'
 import type { AniStreamPayload, AniSubtitleTrack } from '@/lib/ani/types'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 30
 
-const REQUEST_TIMEOUT_MS = 10_000
 const CACHE_HEADER = 'public, max-age=3600'
 
 export function OPTIONS() {
@@ -63,31 +68,30 @@ export async function GET(request: Request) {
   const target = proxiedUrl.startsWith('http') ? proxiedUrl : `${config.baseUrl}${proxiedUrl}`
   if (!target.startsWith(config.baseUrl)) return proxyJson({ error: 'SUBTITLE_TRACK_NOT_FOUND' }, 404)
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
-  try {
-    const response = await fetch(target, {
+  // Captured as a const so the closure keeps the narrowing from the guard above.
+  const apiKey = config.apiKey
+  const outcome = await runWithRetry(async () => {
+    const response = await fetchUpstream(target, {
       headers: {
-        'X-API-Key': config.apiKey,
+        'X-API-Key': apiKey,
         'User-Agent': 'OtakuNaijaPlay',
         Referer: referer,
         accept: 'text/vtt, */*',
       },
-      signal: controller.signal,
       cache: 'no-store',
     })
     if (!response.ok) {
       await response.body?.cancel().catch(() => {})
-      return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
+      return { failed: true as const }
     }
+    return { failed: false as const, text: await readTextUpstream(response) }
+  }, target, 'ani-subtitle')
 
-    const headers = new Headers(corsHeaders())
-    headers.set('Content-Type', 'text/vtt; charset=utf-8')
-    headers.set('Cache-Control', CACHE_HEADER)
-    return new Response(await response.text(), { status: 200, headers })
-  } catch {
-    return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
-  } finally {
-    clearTimeout(timer)
-  }
+  if (!outcome.ok) return proxyJson({ error: outcome.code }, outcome.status)
+  if (outcome.value.failed) return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
+
+  const headers = new Headers(corsHeaders())
+  headers.set('Content-Type', 'text/vtt; charset=utf-8')
+  headers.set('Cache-Control', CACHE_HEADER)
+  return new Response(outcome.value.text, { status: 200, headers })
 }

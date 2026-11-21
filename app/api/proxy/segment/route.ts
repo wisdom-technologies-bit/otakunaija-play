@@ -55,9 +55,27 @@
  *
  * A range from the middle of a file is never sniffed: its first byte is not a
  * sync byte and proves nothing.
+ *
+ * NO HANG. A CDN that answers the headers and then stops sending used to hold
+ * the request open indefinitely: on 2026-11-21 a plain full GET of one segment
+ * sat for 20 s with 0 bytes received and no error at all. Every upstream call
+ * now has a deadline (see lib/proxy-upstream.ts): ~10 s to the response headers,
+ * ~15 s with no body bytes, and ONE retry for a timeout, a network error or an
+ * upstream 5xx (never for a 4xx). A final failure is a fast, CORS-carrying 504
+ * (`UPSTREAM_TIMEOUT`) or 502 (`UPSTREAM_FETCH_FAILED`), so hls.js can retry and
+ * the player can show a real code. The signed URL is never logged: only
+ * `host + path`.
  */
 
 import { corsHeaders, proxyJson, verifyProxySignature, withDefaultUserAgent } from '@/lib/proxy-signing'
+import {
+  fetchUpstream,
+  readWholeWithStall,
+  runWithRetry,
+  stalledReader,
+  stallGuardedStream,
+  type StalledReader,
+} from '@/lib/proxy-upstream'
 
 export const runtime = 'edge'
 
@@ -255,12 +273,32 @@ function defaultType(targetUrl: string) {
 }
 
 /**
- * Reads just enough of the body to decide, and keeps every byte it consumed.
- * `head` is at most PROBE_BYTES; `tail` holds the rest in order, so the
- * replayed stream below is byte-for-byte the upstream body.
+ * Splits what was already read into a `head` of at most `headBytes` and the
+ * untouched `tail`, in order, so the replayed stream is byte-for-byte the
+ * upstream body.
  */
-async function readProbe(body: ReadableStream<Uint8Array>) {
-  const reader = body.getReader()
+function splitProbe(parts: Uint8Array[], headBytes: number) {
+  const total = parts.reduce((sum, part) => sum + part.length, 0)
+  const head = new Uint8Array(Math.min(headBytes, total))
+  const tail: Uint8Array[] = []
+  let filled = 0
+  for (const part of parts) {
+    if (filled >= head.length) { tail.push(part); continue }
+    const take = Math.min(part.length, head.length - filled)
+    head.set(part.subarray(0, take), filled)
+    filled += take
+    if (take < part.length) tail.push(part.subarray(take))
+  }
+  return { head, tail }
+}
+
+/**
+ * Reads just enough of the body to decide, and keeps every byte it consumed.
+ * `head` is at most PROBE_BYTES; `tail` holds the rest in order. Every read is
+ * bounded by the stall deadline, so a body that stops mid-probe fails fast
+ * instead of holding the request open.
+ */
+async function readProbe(reader: StalledReader) {
   const parts: Uint8Array[] = []
   let total = 0
   let done = false
@@ -271,21 +309,11 @@ async function readProbe(body: ReadableStream<Uint8Array>) {
     parts.push(step.value)
     total += step.value.length
   }
-  const head = new Uint8Array(Math.min(PROBE_BYTES, total))
-  const tail: Uint8Array[] = []
-  let filled = 0
-  for (const part of parts) {
-    if (filled >= head.length) { tail.push(part); continue }
-    const take = Math.min(part.length, head.length - filled)
-    head.set(part.subarray(0, take), filled)
-    filled += take
-    if (take < part.length) tail.push(part.subarray(take))
-  }
-  return { head, tail, reader, done }
+  return { ...splitProbe(parts, PROBE_BYTES), reader, done }
 }
 
 /** The consumed prefix first, then the untouched remainder of the upstream body. */
-function replay(head: Uint8Array, tail: Uint8Array[], reader: ReadableStreamDefaultReader<Uint8Array>, done: boolean) {
+function replay(head: Uint8Array, tail: Uint8Array[], reader: StalledReader, done: boolean) {
   return new ReadableStream<Uint8Array>({
     start(controller) {
       if (head.length > 0) controller.enqueue(head)
@@ -293,95 +321,140 @@ function replay(head: Uint8Array, tail: Uint8Array[], reader: ReadableStreamDefa
       if (done) controller.close()
     },
     async pull(controller) {
-      const step = await reader.read()
-      if (step.done) { controller.close(); return }
-      if (step.value && step.value.length > 0) controller.enqueue(step.value)
+      // The Response has already gone out, so a stall here can only end the
+      // stream with an error; the player sees a truncated fragment and retries.
+      try {
+        const step = await reader.read()
+        if (step.done) { controller.close(); return }
+        if (step.value && step.value.length > 0) controller.enqueue(step.value)
+      } catch (error) {
+        controller.error(error)
+        await reader.cancel()
+      }
     },
     cancel(reason) { return reader.cancel(reason) },
   })
 }
 
+type Verified = { targetUrl: string; headers: Record<string, string> }
+
+/**
+ * One attempt. Throws `UpstreamError` for anything a second identical GET could
+ * fix (timeout, network, 5xx) and returns a Response for everything else,
+ * including the 4xx the CDN means and the 416 the player recovers from.
+ */
+async function attemptProxy(verified: Verified, range: string | null): Promise<Response> {
+  const upstreamHeaders = withDefaultUserAgent(verified.headers)
+  if (range) upstreamHeaders.Range = range
+
+  const response = await fetchUpstream(verified.targetUrl, {
+    headers: upstreamHeaders,
+    redirect: 'follow',
+    cache: 'no-store',
+  })
+  // 200 and 206 are both ok; let 416 (bad range) through so the player can recover.
+  if (!response.ok && response.status !== 416) return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
+
+  const upstreamType = response.headers.get('Content-Type') ?? ''
+  const headers = new Headers(corsHeaders())
+  for (const name of PASSTHROUGH_HEADERS) {
+    const value = response.headers.get(name)
+    if (value) headers.set(name, value)
+  }
+  headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges')
+  headers.set('Cache-Control', 'public, max-age=3600')
+  if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes')
+
+  // A body that cannot start with a sync byte proves nothing, so sniffing only
+  // applies to a full body or a range that begins at byte 0. A 416 passes
+  // through untouched: its body explains the bad range and the player recovers
+  // from the status, not from a relabelled body.
+  const fullBody = response.status !== 416 && (response.status === 200 || !range || /^bytes=0-/.test(range.trim()))
+  const length = knownLength(response.headers.get('Content-Length'))
+  const sniffable = fullBody && isSuspiciousType(upstreamType)
+
+  // The default path, and the one every correctly typed segment takes: hand the
+  // stream straight back without reading a byte of it. The stall guard costs no
+  // read until the player asks for one.
+  if (!sniffable) {
+    headers.set('Content-Type', upstreamType || defaultType(verified.targetUrl))
+    const body = response.body ? stallGuardedStream(response.body) : null
+    return new Response(body, { status: response.status, headers })
+  }
+
+  if (length !== null && length <= SNIFF_MAX_BYTES && response.body) {
+    const reader = stalledReader(response.body)
+    const buffered = await readWholeWithStall(reader, SNIFF_MAX_BYTES)
+
+    if (buffered.overflow) {
+      // The CDN promised <= 2 MB and sent more. Stop buffering, decide from the
+      // prefix, replay the rest, and drop the length that was a lie.
+      headers.delete('Content-Length')
+      const { head, tail } = splitProbe(buffered.parts, PROBE_BYTES)
+      if (looksLikeMarkup(head)) {
+        await reader.cancel()
+        return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
+      }
+      headers.set('Content-Type', responseType(head, upstreamType, verified.targetUrl))
+      return new Response(replay(head, tail, reader, false), { status: response.status, headers })
+    }
+
+    const bytes = buffered.bytes
+    // Markup is never a segment, whatever the label says. Reject it so the
+    // player retries (and, for an ani stream, excludes the provider) instead of
+    // feeding an error page to the demuxer.
+    if (looksLikeMarkup(bytes)) {
+      await reader.cancel()
+      return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
+    }
+
+    // The bytes decide, not the label: TS under `text/html` (the measured
+    // 931 KB segment), `text/css`, `application/javascript`, `image/jpeg` or
+    // `application/octet-stream` is all real media and all becomes video/mp2t.
+    headers.set('Content-Type', responseType(bytes, upstreamType, verified.targetUrl))
+    if (fullBody && bytes.length > 0) headers.set('Content-Length', String(bytes.length))
+    return new Response(bytes, { status: response.status, headers })
+  }
+
+  // Unknown length (chunked) or a body larger than the buffer budget: read only
+  // the probe, decide, and stream the rest with the consumed bytes replayed.
+  if (!response.body) {
+    headers.set('Content-Type', upstreamType || defaultType(verified.targetUrl))
+    return new Response(null, { status: response.status, headers })
+  }
+
+  const reader = stalledReader(response.body)
+  const probe = await readProbe(reader)
+  if (looksLikeMarkup(probe.head)) {
+    await reader.cancel()
+    return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
+  }
+
+  headers.set('Content-Type', responseType(probe.head, upstreamType, verified.targetUrl))
+  // Content-Length is only ever absent or larger than what was sniffed here, so
+  // the passthrough value stays true and is left alone. Nothing is invented:
+  // deciding whether the stream has ended would mean waiting for the next chunk.
+
+  return new Response(replay(probe.head, probe.tail, reader, probe.done), { status: response.status, headers })
+}
+
+/**
+ * The retry loop. One extra attempt for a timeout, a network error or an
+ * upstream 5xx; a 4xx comes back as a Response from `attemptProxy` and is never
+ * repeated. A final failure is a fast, CORS-carrying JSON body so the player can
+ * retry a fragment and show a real code instead of waiting for nothing.
+ */
 async function handleProxy(request: Request) {
   const params = new URL(request.url).searchParams
   const verified = await verifyProxySignature(params.get('u') ?? '', params.get('h') ?? '', params.get('e') ?? '', params.get('s') ?? '')
   if (!verified.valid || !verified.targetUrl || !verified.headers) return proxyJson({ error: 'INVALID_OR_EXPIRED_SIGNATURE' }, 403)
+  const target: Verified = { targetUrl: verified.targetUrl, headers: verified.headers }
   const range = request.headers.get('Range')
-  try {
-    const upstreamHeaders = withDefaultUserAgent(verified.headers)
-    if (range) upstreamHeaders.Range = range
 
-    const response = await fetch(verified.targetUrl, {
-      headers: upstreamHeaders,
-      redirect: 'follow',
-      cache: 'no-store',
-    })
-    // 200 and 206 are both ok; let 416 (bad range) through so the player can recover.
-    if (!response.ok && response.status !== 416) return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
-
-    const upstreamType = response.headers.get('Content-Type') ?? ''
-    const headers = new Headers(corsHeaders())
-    for (const name of PASSTHROUGH_HEADERS) {
-      const value = response.headers.get(name)
-      if (value) headers.set(name, value)
-    }
-    headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges')
-    headers.set('Cache-Control', 'public, max-age=3600')
-    if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes')
-
-    // A body that cannot start with a sync byte proves nothing, so sniffing only
-    // applies to a full body or a range that begins at byte 0. A 416 passes
-    // through untouched: its body explains the bad range and the player recovers
-    // from the status, not from a relabelled body.
-    const fullBody = response.status !== 416 && (response.status === 200 || !range || /^bytes=0-/.test(range.trim()))
-    const length = knownLength(response.headers.get('Content-Length'))
-    const sniffable = fullBody && isSuspiciousType(upstreamType)
-
-    // The default path, and the one every correctly typed segment takes: hand the
-    // stream straight back without reading a byte of it.
-    if (!sniffable) {
-      headers.set('Content-Type', upstreamType || defaultType(verified.targetUrl))
-      return new Response(response.body, { status: response.status, headers })
-    }
-
-    if (length !== null && length <= SNIFF_MAX_BYTES && response.body) {
-      const bytes = new Uint8Array(await response.arrayBuffer())
-
-      // Markup is never a segment, whatever the label says. Reject it so the
-      // player retries (and, for an ani stream, excludes the provider) instead of
-      // feeding an error page to the demuxer.
-      if (looksLikeMarkup(bytes)) {
-        return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
-      }
-
-      // The bytes decide, not the label: TS under `text/html` (the measured
-      // 931 KB segment), `text/css`, `application/javascript`, `image/jpeg` or
-      // `application/octet-stream` is all real media and all becomes video/mp2t.
-      headers.set('Content-Type', responseType(bytes, upstreamType, verified.targetUrl))
-      if (fullBody && bytes.length > 0) headers.set('Content-Length', String(bytes.length))
-
-      return new Response(bytes, { status: response.status, headers })
-    }
-
-    // Unknown length (chunked) or a body larger than the buffer budget: read only
-    // the probe, decide, and stream the rest with the consumed bytes replayed.
-    if (!response.body) {
-      headers.set('Content-Type', upstreamType || defaultType(verified.targetUrl))
-      return new Response(null, { status: response.status, headers })
-    }
-
-    const probe = await readProbe(response.body)
-    if (looksLikeMarkup(probe.head)) {
-      await probe.reader.cancel().catch(() => {})
-      return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502)
-    }
-
-    headers.set('Content-Type', responseType(probe.head, upstreamType, verified.targetUrl))
-    // Content-Length is only ever absent or larger than what was sniffed here, so
-    // the passthrough value stays true and is left alone. Nothing is invented:
-    // deciding whether the stream has ended would mean waiting for the next chunk.
-
-    return new Response(replay(probe.head, probe.tail, probe.reader, probe.done), { status: response.status, headers })
-  } catch { return proxyJson({ error: 'UPSTREAM_FETCH_FAILED' }, 502) }
+  // One retry for a timeout, a network error or an upstream 5xx; never for a 4xx.
+  const outcome = await runWithRetry(() => attemptProxy(target, range), target.targetUrl, 'segment')
+  if (outcome.ok) return outcome.value
+  return proxyJson({ error: outcome.code }, outcome.status)
 }
 
 /**

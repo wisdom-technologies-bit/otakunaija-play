@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HLS stream probe</title>
+<style>
+  body { font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; background:#0b1013; color:#dbe7e3; margin:0; padding:16px; }
+  h1 { font-size:15px; margin:0 0 8px; color:#b7f36b; }
+  #bar { position:sticky; top:0; background:#0b1013; padding:6px 0; border-bottom:1px solid #1e2b2e; z-index:2; }
+  #state { color:#8fb3a8; }
+  #log { white-space:pre-wrap; }
+  .err { color:#ff8b7a; }
+  .warn { color:#ffd479; }
+  .ok { color:#8ce99a; }
+  video { width:320px; background:#000; display:block; margin-bottom:8px; }
+</style>
+</head>
+<body>
+<h1>HLS stream probe</h1>
+<div id="bar"><span id="state">booting…</span></div>
+<video id="v" muted playsinline controls></video>
+<div id="log"></div>
+<script type="module">
+const qs = new URLSearchParams(location.search);
+const src = qs.get('u');
+const log = document.getElementById('log');
+const state = document.getElementById('state');
+const t0 = Date.now();
+const rows = [];
+
+function line(kind, msg) {
+  const at = ((Date.now() - t0) / 1000).toFixed(1);
+  rows.push(`${at}s\t${kind}\t${msg}`);
+  const div = document.createElement('div');
+  if (kind === 'ERROR') div.className = 'err';
+  else if (kind === 'WARN') div.className = 'warn';
+  else if (kind === 'OK') div.className = 'ok';
+  div.textContent = `${at}s\t${kind}\t${msg}`;
+  log.appendChild(div);
+}
+
+if (!src) {
+  line('ERROR', 'missing ?u= manifest url');
+} else {
+  line('INFO', 'manifest ' + src.slice(0, 160) + '…');
+  const Hls = (await import('https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.mjs')).default;
+  const video = document.getElementById('v');
+  const hls = new Hls({
+    debug: false,
+    enableWorker: true,
+    capLevelToPlayerSize: true,
+    maxBufferLength: 30,
+    maxMaxBufferLength: 60,
+  });
+  window.__hls = hls;
+  window.__rows = rows;
+
+  hls.on(Hls.Events.MANIFEST_PARSED, (_e, d) => {
+    line('OK', `manifest parsed: ${d.levels.length} level(s) ` + d.levels.map(l => `${l.width}x${l.height}@${Math.round(l.bitrate/1000)}k`).join(' | '));
+    video.play().catch((err) => line('WARN', 'play() rejected: ' + err.name));
+  });
+  hls.on(Hls.Events.LEVEL_SWITCHED, (_e, d) => {
+    const l = hls.levels[d.level];
+    line('INFO', `level -> ${d.level} ${l.width}x${l.height}@${Math.round(l.bitrate/1000)}k`);
+  });
+  hls.on(Hls.Events.FRAG_LOADING, (_e, d) => {
+    line('INFO', `frag ${d.frag.sn} sn=${d.frag.sn} start=${d.frag.start.toFixed(2)} loading`);
+  });
+  hls.on(Hls.Events.FRAG_LOADED, (_e, d) => {
+    const st = d.frag.stats;
+    line('OK', `frag ${d.frag.sn} loaded ${st.loaded}B in ${Math.round(st.loading?.end - st.loading?.start)}ms`);
+  });
+  hls.on(Hls.Events.FRAG_CHANGED, (_e, d) => {
+    line('INFO', `frag ${d.frag.sn} playing at ${video.currentTime.toFixed(2)}`);
+  });
+  hls.on(Hls.Events.ERROR, (_e, d) => {
+    line('ERROR', `${d.fatal ? 'FATAL' : 'nonfatal'} ${d.type}/${d.details} ${d.reason || ''} ${d.response?.code ? 'code=' + d.response.code : ''} ${d.response?.text ? 'text=' + String(d.response.text).slice(0, 80) : ''}`);
+  });
+
+  video.addEventListener('stalled', () => line('WARN', 'element stalled'));
+  video.addEventListener('waiting', () => line('WARN', 'element waiting'));
+  video.addEventListener('ended', () => line('ERROR', 'element ended'));
+  video.addEventListener('error', () => line('ERROR', 'element error ' + (video.error && video.error.code) + ' ' + (video.error && video.error.message)));
+
+  hls.loadSource(src);
+  hls.attachMedia(video);
+
+  setInterval(() => {
+    const b = video.buffered;
+    const end = b.length ? b.end(b.length - 1) : 0;
+    const ahead = (end - video.currentTime).toFixed(2);
+    state.textContent = `t=${video.currentTime.toFixed(1)}s buffered_ahead=${ahead}s readyState=${video.readyState} paused=${video.paused} net=${video.networkState} frags=${rows.filter(r => r.includes('loaded')).length}`;
+  }, 1000);
+}
+</script>
+</body>
+</html>

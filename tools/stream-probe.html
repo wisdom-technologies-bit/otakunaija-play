@@ -48,7 +48,75 @@
   if (!window.Hls || !window.Hls.isSupported()) { line('ERROR', 'hls.js not available / MSE unsupported'); return; }
 
   line('INFO', 'manifest ' + src.slice(0, 120) + '...');
+  line('INFO', FIXED ? 'mode: FIXED (watchdog settles on playing)' : 'mode: BUGGY (hls.js path never settles the watchdog)');
   var video = document.getElementById('v');
+
+  // ---- verbatim copy of lib/player/start-watchdog.ts from otakunaija-main ----
+  var DEFAULT_MANIFEST_GRACE_MS = 25000, DEFAULT_PROGRESS_GRACE_MS = 25000, DEFAULT_HARD_CAP_MS = 60000;
+  function StartWatchdog(options) {
+    this.onExpire = options.onExpire;
+    this.manifestGraceMs = options.manifestGraceMs || DEFAULT_MANIFEST_GRACE_MS;
+    this.progressGraceMs = options.progressGraceMs || DEFAULT_PROGRESS_GRACE_MS;
+    this.hardCapMs = options.hardCapMs || DEFAULT_HARD_CAP_MS;
+    this.graceTimer = null; this.hardTimer = null;
+    this.started = false; this.settled = false; this.sawFragment = false; this.lastBytes = 0;
+  }
+  StartWatchdog.prototype.start = function () {
+    if (this.started || this.settled) return;
+    this.started = true;
+    var self = this;
+    this.hardTimer = setTimeout(function () { self.expire('hard-cap'); }, this.hardCapMs);
+    this.armGrace(this.manifestGraceMs, 'no-fragment');
+  };
+  StartWatchdog.prototype.noteManifestLoaded = function () {
+    if (!this.started || this.settled || this.sawFragment) return;
+    this.armGrace(this.manifestGraceMs, 'no-fragment');
+  };
+  StartWatchdog.prototype.noteFragmentLoading = function () {
+    if (!this.started || this.settled) return;
+    this.sawFragment = true;
+    this.armGrace(this.progressGraceMs, 'no-progress');
+  };
+  StartWatchdog.prototype.noteProgress = function (loadedBytes) {
+    if (!this.started || this.settled) return;
+    if (!isFinite(loadedBytes) || loadedBytes <= this.lastBytes) return;
+    this.lastBytes = loadedBytes;
+    if (this.sawFragment) this.armGrace(this.progressGraceMs, 'no-progress');
+  };
+  StartWatchdog.prototype.notePlaying = function () { this.settled = true; this.clear(); };
+  StartWatchdog.prototype.cancel = function () { this.settled = true; this.clear(); };
+  StartWatchdog.prototype.armGrace = function (ms, reason) {
+    if (this.graceTimer) clearTimeout(this.graceTimer);
+    var self = this;
+    this.graceTimer = setTimeout(function () { self.expire(reason); }, ms);
+  };
+  StartWatchdog.prototype.expire = function (reason) {
+    if (this.settled) return;
+    this.settled = true; this.clear();
+    this.onExpire(reason);
+  };
+  StartWatchdog.prototype.clear = function () {
+    if (this.graceTimer) clearTimeout(this.graceTimer);
+    if (this.hardTimer) clearTimeout(this.hardTimer);
+    this.graceTimer = null; this.hardTimer = null;
+  };
+  // ---------------------------------------------------------------------------
+
+  // ?fixed=1 applies the proposed fix: settle the watchdog when playback starts.
+  var FIXED = qsFixed();
+  function qsFixed() { return /[?&]fixed=1/.test(location.href); }
+
+  var wd = new StartWatchdog({
+    onExpire: function (reason) {
+      line('ERROR', 'WATCHDOG EXPIRED reason=' + reason + ' at t=' + video.currentTime.toFixed(1) + 's ' +
+        '(readyState=' + video.readyState + ', still playing=' + !video.paused + ') -> player would call handlePlaybackFailure() and stop');
+    }
+  });
+  if (FIXED) {
+    video.addEventListener('playing', function () { line('INFO', 'watchdog settled by the playing event (fix)'); wd.notePlaying(); });
+    video.addEventListener('canplay', function () { wd.notePlaying(); });
+  }
+
   var hls = new window.Hls({
     debug: false,
     enableWorker: true,
@@ -59,6 +127,7 @@
   window.__hls = hls;
 
   hls.on(window.Hls.Events.MANIFEST_PARSED, function (_e, d) {
+    wd.noteManifestLoaded();
     var levels = d.levels.map(function (l) { return l.width + 'x' + l.height + '@' + Math.round(l.bitrate / 1000) + 'k'; });
     line('OK', 'manifest parsed: ' + d.levels.length + ' level(s) ' + levels.join(' | '));
     video.play().catch(function (err) { line('WARN', 'play() rejected: ' + err.name); });
@@ -68,12 +137,15 @@
     line('INFO', 'level -> ' + d.level + ' ' + l.width + 'x' + l.height + '@' + Math.round(l.bitrate / 1000) + 'k');
   });
   hls.on(window.Hls.Events.FRAG_LOADING, function (_e, d) {
+    wd.noteFragmentLoading();
     line('INFO', 'frag ' + d.frag.sn + ' start=' + d.frag.start.toFixed(2) + ' loading');
   });
   hls.on(window.Hls.Events.FRAG_LOADED, function (_e, d) {
     var st = d.frag.stats;
     var ms = (st.loading && st.loading.end && st.loading.start) ? Math.round(st.loading.end - st.loading.start) : '?';
     line('OK', 'frag ' + d.frag.sn + ' loaded ' + st.loaded + 'B in ' + ms + 'ms');
+    var bb = video.buffered;
+    wd.noteProgress(bb.length > 0 ? bb.end(bb.length - 1) : Number.MAX_SAFE_INTEGER);
   });
   hls.on(window.Hls.Events.FRAG_CHANGED, function (_e, d) {
     line('INFO', 'frag ' + d.frag.sn + ' playing at ' + video.currentTime.toFixed(2));
@@ -91,6 +163,12 @@
   video.addEventListener('error', function () {
     line('ERROR', 'element error ' + (video.error && video.error.code) + ' ' + (video.error && video.error.message));
   });
+
+  video.addEventListener('progress', function () {
+    var bb = video.buffered;
+    wd.noteProgress(bb.length > 0 ? bb.end(bb.length - 1) : video.currentTime);
+  });
+  wd.start();
 
   hls.loadSource(src);
   hls.attachMedia(video);

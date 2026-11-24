@@ -21,78 +21,88 @@
 <div id="bar"><span id="state">booting…</span></div>
 <video id="v" muted playsinline controls></video>
 <div id="log"></div>
-<script type="module">
-const qs = new URLSearchParams(location.search);
-const src = qs.get('u');
-const log = document.getElementById('log');
-const state = document.getElementById('state');
-const t0 = Date.now();
-const rows = [];
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<script>
+(function () {
+  var qs = new URLSearchParams(location.search);
+  var src = qs.get('u');
+  var logEl = document.getElementById('log');
+  var stateEl = document.getElementById('state');
+  var t0 = Date.now();
+  var rows = [];
+  window.__rows = rows;
 
-function line(kind, msg) {
-  const at = ((Date.now() - t0) / 1000).toFixed(1);
-  rows.push(`${at}s\t${kind}\t${msg}`);
-  const div = document.createElement('div');
-  if (kind === 'ERROR') div.className = 'err';
-  else if (kind === 'WARN') div.className = 'warn';
-  else if (kind === 'OK') div.className = 'ok';
-  div.textContent = `${at}s\t${kind}\t${msg}`;
-  log.appendChild(div);
-}
+  function line(kind, msg) {
+    var at = ((Date.now() - t0) / 1000).toFixed(1);
+    rows.push(at + 's\t' + kind + '\t' + msg);
+    var div = document.createElement('div');
+    if (kind === 'ERROR') div.className = 'err';
+    else if (kind === 'WARN') div.className = 'warn';
+    else if (kind === 'OK') div.className = 'ok';
+    div.textContent = at + 's\t' + kind + '\t' + msg;
+    logEl.appendChild(div);
+  }
 
-if (!src) {
-  line('ERROR', 'missing ?u= manifest url');
-} else {
-  line('INFO', 'manifest ' + src.slice(0, 160) + '…');
-  const Hls = (await import('https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.mjs')).default;
-  const video = document.getElementById('v');
-  const hls = new Hls({
+  if (!src) { line('ERROR', 'missing ?u= manifest url'); return; }
+  if (!window.Hls || !window.Hls.isSupported()) { line('ERROR', 'hls.js not available / MSE unsupported'); return; }
+
+  line('INFO', 'manifest ' + src.slice(0, 120) + '...');
+  var video = document.getElementById('v');
+  var hls = new window.Hls({
     debug: false,
     enableWorker: true,
     capLevelToPlayerSize: true,
     maxBufferLength: 30,
-    maxMaxBufferLength: 60,
+    maxMaxBufferLength: 60
   });
   window.__hls = hls;
-  window.__rows = rows;
 
-  hls.on(Hls.Events.MANIFEST_PARSED, (_e, d) => {
-    line('OK', `manifest parsed: ${d.levels.length} level(s) ` + d.levels.map(l => `${l.width}x${l.height}@${Math.round(l.bitrate/1000)}k`).join(' | '));
-    video.play().catch((err) => line('WARN', 'play() rejected: ' + err.name));
+  hls.on(window.Hls.Events.MANIFEST_PARSED, function (_e, d) {
+    var levels = d.levels.map(function (l) { return l.width + 'x' + l.height + '@' + Math.round(l.bitrate / 1000) + 'k'; });
+    line('OK', 'manifest parsed: ' + d.levels.length + ' level(s) ' + levels.join(' | '));
+    video.play().catch(function (err) { line('WARN', 'play() rejected: ' + err.name); });
   });
-  hls.on(Hls.Events.LEVEL_SWITCHED, (_e, d) => {
-    const l = hls.levels[d.level];
-    line('INFO', `level -> ${d.level} ${l.width}x${l.height}@${Math.round(l.bitrate/1000)}k`);
+  hls.on(window.Hls.Events.LEVEL_SWITCHED, function (_e, d) {
+    var l = hls.levels[d.level];
+    line('INFO', 'level -> ' + d.level + ' ' + l.width + 'x' + l.height + '@' + Math.round(l.bitrate / 1000) + 'k');
   });
-  hls.on(Hls.Events.FRAG_LOADING, (_e, d) => {
-    line('INFO', `frag ${d.frag.sn} sn=${d.frag.sn} start=${d.frag.start.toFixed(2)} loading`);
+  hls.on(window.Hls.Events.FRAG_LOADING, function (_e, d) {
+    line('INFO', 'frag ' + d.frag.sn + ' start=' + d.frag.start.toFixed(2) + ' loading');
   });
-  hls.on(Hls.Events.FRAG_LOADED, (_e, d) => {
-    const st = d.frag.stats;
-    line('OK', `frag ${d.frag.sn} loaded ${st.loaded}B in ${Math.round(st.loading?.end - st.loading?.start)}ms`);
+  hls.on(window.Hls.Events.FRAG_LOADED, function (_e, d) {
+    var st = d.frag.stats;
+    var ms = (st.loading && st.loading.end && st.loading.start) ? Math.round(st.loading.end - st.loading.start) : '?';
+    line('OK', 'frag ' + d.frag.sn + ' loaded ' + st.loaded + 'B in ' + ms + 'ms');
   });
-  hls.on(Hls.Events.FRAG_CHANGED, (_e, d) => {
-    line('INFO', `frag ${d.frag.sn} playing at ${video.currentTime.toFixed(2)}`);
+  hls.on(window.Hls.Events.FRAG_CHANGED, function (_e, d) {
+    line('INFO', 'frag ' + d.frag.sn + ' playing at ' + video.currentTime.toFixed(2));
   });
-  hls.on(Hls.Events.ERROR, (_e, d) => {
-    line('ERROR', `${d.fatal ? 'FATAL' : 'nonfatal'} ${d.type}/${d.details} ${d.reason || ''} ${d.response?.code ? 'code=' + d.response.code : ''} ${d.response?.text ? 'text=' + String(d.response.text).slice(0, 80) : ''}`);
+  hls.on(window.Hls.Events.ERROR, function (_e, d) {
+    var extra = '';
+    if (d.response) extra += ' code=' + d.response.code + ' text=' + String(d.response.text || '').slice(0, 90);
+    if (d.reason) extra += ' reason=' + d.reason;
+    line('ERROR', (d.fatal ? 'FATAL ' : 'nonfatal ') + d.type + '/' + d.details + extra);
   });
 
-  video.addEventListener('stalled', () => line('WARN', 'element stalled'));
-  video.addEventListener('waiting', () => line('WARN', 'element waiting'));
-  video.addEventListener('ended', () => line('ERROR', 'element ended'));
-  video.addEventListener('error', () => line('ERROR', 'element error ' + (video.error && video.error.code) + ' ' + (video.error && video.error.message)));
+  video.addEventListener('stalled', function () { line('WARN', 'element stalled'); });
+  video.addEventListener('waiting', function () { line('WARN', 'element waiting'); });
+  video.addEventListener('ended', function () { line('ERROR', 'element ended'); });
+  video.addEventListener('error', function () {
+    line('ERROR', 'element error ' + (video.error && video.error.code) + ' ' + (video.error && video.error.message));
+  });
 
   hls.loadSource(src);
   hls.attachMedia(video);
 
-  setInterval(() => {
-    const b = video.buffered;
-    const end = b.length ? b.end(b.length - 1) : 0;
-    const ahead = (end - video.currentTime).toFixed(2);
-    state.textContent = `t=${video.currentTime.toFixed(1)}s buffered_ahead=${ahead}s readyState=${video.readyState} paused=${video.paused} net=${video.networkState} frags=${rows.filter(r => r.includes('loaded')).length}`;
+  setInterval(function () {
+    var b = video.buffered;
+    var end = b.length ? b.end(b.length - 1) : 0;
+    var loaded = 0;
+    for (var i = 0; i < rows.length; i++) if (rows[i].indexOf('loaded') !== -1) loaded++;
+    stateEl.textContent = 't=' + video.currentTime.toFixed(1) + 's ahead=' + (end - video.currentTime).toFixed(2) +
+      's readyState=' + video.readyState + ' paused=' + video.paused + ' net=' + video.networkState + ' frags=' + loaded;
   }, 1000);
-}
+})();
 </script>
 </body>
 </html>

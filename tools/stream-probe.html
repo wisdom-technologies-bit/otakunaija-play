@@ -26,8 +26,8 @@
 </script>
 <script>
 (function () {
-  var qs = new URLSearchParams(location.search);
-  var src = qs.get('u');
+  var m = location.href.match(/[?&]u=([^&]+)/);
+  var src = m ? decodeURIComponent(m[1]) : null;
   var logEl = document.getElementById('log');
   var stateEl = document.getElementById('state');
   var t0 = Date.now();
@@ -45,6 +45,7 @@
     logEl.appendChild(div);
   }
 
+  document.getElementById('state').textContent = 'script ran; u=' + (src ? 'present' : 'MISSING') + ' href=' + location.href.slice(0, 120);
   if (!src) { line('ERROR', 'missing ?u= manifest url'); return; }
   if (!window.Hls || !window.Hls.isSupported()) { line('ERROR', 'hls.js not available / MSE unsupported'); return; }
 
